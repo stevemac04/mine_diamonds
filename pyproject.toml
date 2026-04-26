@@ -19,12 +19,8 @@ minecraft-demo = [
   "keyboard>=0.13.5",
   "mss>=9.0.0",
   "opencv-python>=4.8.0",
-]
-crafter = [
-  "crafter>=1.8.3",
   "tensorboard>=2.15",
-  "imageio[ffmpeg]>=2.34",
-  "moviepy>=1.0.3",
+  "matplotlib>=3.8.0",
 ]
 
 [tool.setuptools.packages.find]

@@ -80,6 +80,73 @@ def release_mouse_left() -> None:
     mouse_left(False)
 
 
+def mouse_right(down: bool) -> None:
+    if _impl == "unset":
+        configure("auto")
+    if _impl == "sendinput":
+        from mine_diamonds.input.win_sendinput import mouse_right as _mr
+
+        _mr(down)
+    else:
+        import pyautogui
+
+        if down:
+            pyautogui.mouseDown(button="right")
+        else:
+            pyautogui.mouseUp(button="right")
+
+
+def click_at(x: int, y: int, *, button: str = "left", hold_ms: int = 60) -> None:
+    """Move cursor to absolute (x, y) and press/release the given button.
+
+    Used for inventory / recipe-book clicks. Not for in-game camera control.
+    """
+    if _impl == "unset":
+        configure("auto")
+    import time
+
+    if _impl == "sendinput":
+        from mine_diamonds.input.win_sendinput import set_cursor_pos
+
+        set_cursor_pos(int(x), int(y))
+    else:
+        import pyautogui
+
+        pyautogui.moveTo(int(x), int(y), duration=0)
+    time.sleep(0.02)
+    if button == "left":
+        mouse_left(True)
+        time.sleep(hold_ms / 1000.0)
+        mouse_left(False)
+    elif button == "right":
+        mouse_right(True)
+        time.sleep(hold_ms / 1000.0)
+        mouse_right(False)
+    else:
+        raise ValueError(f"unsupported button {button!r}")
+
+
+def type_text(text: str, *, per_char_ms: int = 35) -> None:
+    """Type ASCII text into whatever has focus (lowercase only, no shift).
+
+    Used for the recipe-book search bar. Letters and digits supported.
+    """
+    import time
+
+    for ch in text.lower():
+        if ch == " ":
+            key_down("space")
+            time.sleep(per_char_ms / 2000.0)
+            key_up("space")
+        elif ch.isalnum():
+            key_down(ch)
+            time.sleep(per_char_ms / 2000.0)
+            key_up(ch)
+        else:
+            continue
+        time.sleep(per_char_ms / 1000.0)
+
+
 def key_down(name: str) -> None:
     if _impl == "unset":
         configure("auto")
@@ -125,3 +192,59 @@ def release_all() -> None:
         mouse_left(False)
     except Exception:
         pass
+
+
+def chat_command(
+    cmd: str,
+    *,
+    open_chat_key: str = "t",
+    open_delay_s: float = 0.20,
+    paste_delay_s: float = 0.10,
+    submit_delay_s: float = 0.20,
+) -> bool:
+    """Open Minecraft chat, paste ``cmd``, press Enter. Returns True if the
+    clipboard write succeeded.
+
+    NOTE: Minecraft must be the foreground window. Caller is responsible for
+    ensuring that. We open chat with ``T`` (no prefilled slash), so callers
+    should include the leading ``/`` in ``cmd`` (e.g. ``/clear @s``).
+
+    Uses the Windows clipboard + Ctrl+V rather than typing each character so
+    that ``/``, ``@``, and other shifted/punctuation chars work regardless of
+    keyboard layout.
+    """
+    import time
+
+    if _impl == "unset":
+        configure("auto")
+
+    try:
+        from mine_diamonds.input.clipboard import set_clipboard_text
+    except RuntimeError:  # pragma: no cover - non-windows
+        return False
+
+    if not set_clipboard_text(cmd):
+        return False
+
+    release_all()
+    time.sleep(0.05)
+
+    key_down(open_chat_key)
+    time.sleep(0.04)
+    key_up(open_chat_key)
+    time.sleep(open_delay_s)
+
+    key_down("ctrl")
+    time.sleep(0.02)
+    key_down("v")
+    time.sleep(0.02)
+    key_up("v")
+    time.sleep(0.02)
+    key_up("ctrl")
+    time.sleep(paste_delay_s)
+
+    key_down("enter")
+    time.sleep(0.04)
+    key_up("enter")
+    time.sleep(submit_delay_s)
+    return True

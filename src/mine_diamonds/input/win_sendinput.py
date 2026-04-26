@@ -32,6 +32,8 @@ INPUT_KEYBOARD = 1
 MOUSEEVENTF_MOVE = 0x0001
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_RIGHTDOWN = 0x0008
+MOUSEEVENTF_RIGHTUP = 0x0010
 
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_SCANCODE = 0x0008
@@ -103,13 +105,53 @@ def mouse_left(down: bool) -> None:
     _send_mouse(0, 0, flags)
 
 
+def mouse_right(down: bool) -> None:
+    flags = MOUSEEVENTF_RIGHTDOWN if down else MOUSEEVENTF_RIGHTUP
+    _send_mouse(0, 0, flags)
+
+
+def set_cursor_pos(x: int, y: int) -> None:
+    """Move the desktop cursor to absolute (x, y) in screen pixels.
+
+    Useful for clicking specific UI elements (inventory slots, recipe book).
+    Don't use this for in-game camera control during RL training; use
+    ``move_rel`` for that, since Minecraft uses raw mouse deltas.
+    """
+    user32.SetCursorPos(int(x), int(y))
+
+
 _VK = {
     "w": 0x57,
     "a": 0x41,
     "s": 0x53,
     "d": 0x44,
+    "e": 0x45,
     "space": 0x20,
+    "esc": 0x1B,
+    "escape": 0x1B,
+    "shift": 0x10,
+    "lshift": 0xA0,
+    "ctrl": 0x11,
+    "lctrl": 0xA2,
+    "tab": 0x09,
+    "enter": 0x0D,
+    "return": 0x0D,
+    "back": 0x08,
+    "backspace": 0x08,
+    "1": 0x31,
+    "2": 0x32,
+    "3": 0x33,
+    "4": 0x34,
+    "5": 0x35,
+    "6": 0x36,
+    "7": 0x37,
+    "8": 0x38,
+    "9": 0x39,
+    "0": 0x30,
 }
+# All ASCII letters a-z share VK_A..VK_Z = 0x41..0x5A.
+for _ch in "abcdefghijklmnopqrstuvwxyz":
+    _VK.setdefault(_ch, 0x41 + (ord(_ch) - ord("a")))
 
 
 def key_vk(name: str, down: bool) -> None:
