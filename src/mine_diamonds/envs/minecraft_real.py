@@ -1,0 +1,1004 @@
+"""Gymnasium env that wraps the running Minecraft Java client.
+
+This is real-game RL: observations are downscaled screenshots of the MC
+window captured with ``mss``; actions are synthetic keyboard/mouse events
+delivered with the project's ``mine_diamonds.input.game_input`` layer
+(Windows ``SendInput`` for raw relative mouse deltas, which Minecraft
+needs); reward is computed from the same screenshot by checking whether
+log-colored pixels have appeared in the player's hotbar slot 1 (vision
+detection via the project's "simple-colors" texture pack BGR ranges).
+
+Task: **mine one log**. Episode ends when the agent picks up at least
+``logs_to_succeed`` log-colored pixel cluster in the hotbar (success), or
+``max_seconds`` of wall-clock time elapses (truncation).
+
+Caveats:
+  * Single env only. Real Minecraft can't be parallelized.
+  * Throughput is bounded by ``frame_time_s`` (default 0.05 s = 20 Hz),
+    so ~20 transitions per second per env.
+  * The MC window must keep keyboard focus for the entire run; alt-tabbing
+    away will break inputs.
+  * Configure Minecraft to a known window size before running. The
+    hotbar position and dimensions are computed from the captured monitor
+    region; you can override them with explicit pixel rects via
+    ``HotbarSpec``.
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
+import cv2
+import gymnasium as gym
+import mss
+import numpy as np
+from gymnasium import spaces
+
+from mine_diamonds.capture import WindowRegion, find_minecraft_window
+from mine_diamonds.input import game_input as ginput
+from mine_diamonds.vision.pack_colors import get_bgr_range
+from mine_diamonds import failsafe as _failsafe
+
+
+# ---------------------------------------------------------------------------
+# Action space
+# ---------------------------------------------------------------------------
+
+# Discrete(8); kept small for sample efficiency. The agent can only run
+# WASD-forward + LMB simultaneously by selecting `FORWARD_ATTACK`; this is
+# the dominant action for tree-mining once aim is correct. ``FORWARD_JUMP``
+# holds W + Space so the agent can hop up onto blocks while exploring (MC
+# auto-jumps when Space is held and the player tries to walk into a 1-block
+# rise).
+NOOP = 0
+FORWARD = 1
+YAW_LEFT = 2
+YAW_RIGHT = 3
+PITCH_UP = 4
+PITCH_DOWN = 5
+FORWARD_ATTACK = 6
+FORWARD_JUMP = 7
+
+ACTION_NAMES: tuple[str, ...] = (
+    "noop",
+    "forward",
+    "yaw_left",
+    "yaw_right",
+    "pitch_up",
+    "pitch_down",
+    "forward_attack",
+    "forward_jump",
+)
+NUM_ACTIONS = len(ACTION_NAMES)
+
+
+@dataclass
+class HotbarSpec:
+    """Pixel rect inside the captured monitor for the hotbar slot to watch.
+
+    Coordinates are relative to the captured monitor's top-left in pixels.
+    Use ``HotbarSpec.from_monitor`` for sane defaults at common resolutions
+    with default GUI scale.
+    """
+
+    x: int
+    y: int
+    w: int
+    h: int
+
+    @classmethod
+    def from_monitor(
+        cls, mon_w: int, mon_h: int, *, slot: int = 1, gui_scale: int = 2
+    ) -> "HotbarSpec":
+        """Compute slot ROI from the captured region's pixel dimensions.
+
+        Vanilla MC hotbar is 182 GUI px wide x 22 px tall, centered at
+        the bottom of the rendered area. At GUI scale 2 (the default on
+        1080p) the rendered hotbar is 364x44 actual pixels. Slot 1 is
+        the leftmost. Slots are 20 GUI px wide. The icon inside each
+        slot is inset ~3 GUI px on each side. We further pad in by
+        ``pad`` actual pixels to be tolerant of texture-pack icon
+        positioning.
+
+        ``mon_w`` and ``mon_h`` should be the dimensions of whatever
+        we're actually capturing. If you've narrowed capture to the MC
+        window's client area (recommended), pass those — not the full
+        monitor.
+        """
+        gs = int(gui_scale)
+        slot_gui_w = 20
+        slot_w = slot_gui_w * gs
+        slot_h = 20 * gs
+        hotbar_gui_w = 182
+        hotbar_w = hotbar_gui_w * gs
+        cx = mon_w // 2
+        hot_left = cx - hotbar_w // 2
+        hotbar_h = 22 * gs
+        hot_bottom = mon_h - 3 * gs
+        hot_top = hot_bottom - hotbar_h
+        slot_left = hot_left + (1 + slot_gui_w * (slot - 1)) * gs
+        slot_top = hot_top + 3 * gs
+        pad = 4
+        return cls(
+            x=slot_left + pad,
+            y=slot_top + pad,
+            w=slot_w - 2 * pad,
+            h=slot_h - 2 * pad,
+        )
+
+
+@dataclass
+class FoveaSpec:
+    """Center-of-screen patch for dense reward shaping.
+
+    Defaults to a centered square covering the middle 1/3 of width/height
+    of the captured monitor.
+    """
+
+    fraction: float = 1.0 / 3.0
+
+    def rect(self, mon_w: int, mon_h: int) -> tuple[int, int, int, int]:
+        fw = int(mon_w * self.fraction)
+        fh = int(mon_h * self.fraction)
+        x = (mon_w - fw) // 2
+        y = (mon_h - fh) // 2
+        return x, y, fw, fh
+
+
+@dataclass
+class MinecraftRealConfig:
+    """Top-level env configuration.
+
+    The defaults assume:
+      * Minecraft Java client running, visible, with the simple-colors
+        texture pack loaded. The env auto-detects the MC window and
+        captures only its client area (so windowed mode works fine).
+      * GUI scale 2.
+      * Survival, peaceful, on roughly flat ground near a tree.
+    """
+
+    # Capture: prefer to detect the MC window automatically. If the env
+    # can't find a window matching ``window_title_substr``, it falls back
+    # to monitor capture at ``monitor_index`` and warns.
+    use_window_detection: bool = True
+    window_title_substr: str = "minecraft"
+    monitor_index: int = 1            # mss monitor index used for fallback only
+    obs_shape: tuple[int, int] = (84, 84)  # downscaled (H, W) for CnnPolicy
+    frame_time_s: float = 0.05        # 20 Hz target *game* tick rate
+    # Sticky-actions / frame skip: each call to env.step() applies the chosen
+    # action ``action_repeat`` times, sleeping ``frame_time_s`` between each
+    # repeat, before reading the next observation. This is the standard
+    # Atari-style trick. Without it, a single yaw step is only ~50 ms long
+    # and PPO oscillates between yaw and other actions before any visible
+    # rotation accumulates. With ``action_repeat=4`` each yaw decision plays
+    # out for ~200 ms, giving the camera time to actually swing.
+    action_repeat: int = 4
+    max_seconds: float = 60.0         # episode timeout (wall-clock)
+    yaw_step_px: int = 60             # mouse dx per yaw_left/right *substep*
+    pitch_step_px: int = 35            # mouse dy per pitch_up/down *substep*
+    logs_to_succeed: int = 1          # episode ends after this many logs in hotbar slot 1
+    gui_scale: int = 2                # MC GUI scale; controls hotbar pixel math
+    log_pixel_threshold: int = 80     # absolute floor for "log present" in slot
+    log_pixel_baseline_margin: int = 200  # auto-baseline: adding a log must produce
+    # at least this many extra log-colored pixels over the empty-slot baseline.
+    auto_baseline_log_threshold: bool = True
+    # Primary detection signal: snapshot the empty slot at reset, then trigger
+    # when the slot ROI looks "different enough" from baseline. This is the
+    # robust signal — pixel-count thresholds get fooled by simple-colors
+    # rendering the empty-slot background dark enough to look like a log.
+    slot_diff_threshold: float = 8.0  # mean BGR delta vs. empty-slot baseline
+    use_slot_diff_detector: bool = True
+    # ---- exploration shaping -------------------------------------------------
+    # Rewards applied per step ONLY when the fovea sees no logs (i.e., the
+    # agent is "blind" and needs to look around). Kept small — they're just
+    # tiebreakers above the step penalty so spinning beats standing still.
+    # The "wood-seeking" gradient comes from ``reward_log_visible_max`` and
+    # ``reward_log_approach_max`` below, which are MUCH larger than these.
+    reward_explore_yaw_when_blind: float = 0.02
+    reward_explore_forward_when_blind: float = 0.005
+    # Below this fovea_log_frac the agent is considered "blind" for shaping.
+    explore_blind_threshold: float = 0.02
+    # Frame-difference (curiosity) shaping. Reward visual change vs. the
+    # frame ``frame_diff_lookback_steps`` ago, scaled by ``reward_frame_diff_max``.
+    # Also kept small — it's only here to slightly favor moving the camera
+    # over staring at a wall.
+    reward_frame_diff_max: float = 0.02
+    # Lookback is in agent steps (post-action-repeat). With action_repeat=4
+    # and frame_time_s=0.05, 5 agent steps = ~1 second of game time.
+    frame_diff_lookback_steps: int = 5
+    frame_diff_saturation: float = 25.0  # mean BGR delta that maxes out the reward
+    # ---- wood-seeking shaping (the dominant gradient) -----------------------
+    # Per-step reward proportional to how many log-colored pixels are visible
+    # ANYWHERE on screen (not just the fovea). This is the "I can see wood"
+    # signal — it fires the moment a tree edges into peripheral view, so the
+    # agent gets a clear gradient as it rotates toward visible wood.
+    # Saturates at ``log_visible_saturation_frac`` of the screen being log.
+    reward_log_visible_max: float = 0.40
+    log_visible_saturation_frac: float = 0.10  # ~10% of screen filled = max
+    # Per-step reward proportional to the INCREASE in visible-log fraction
+    # vs. the previous step. Encodes "you are approaching / centering on
+    # wood" — walking toward a tree (or yawing to bring it closer to center)
+    # makes it bigger on screen, which fires this. Negative deltas (wood
+    # leaving view) get zero, not a penalty, to avoid a "stand still" trap.
+    # Saturation tuned so a typical "walking step" toward a tree (~0.005
+    # delta per agent step) earns ~half of the cap, giving a smooth pull.
+    reward_log_approach_max: float = 0.80
+    log_approach_saturation_delta: float = 0.01  # +1% of screen per step = max
+    # ---- auto-reset (in-game) ------------------------------------------------
+    # After every episode the env can run an in-game chat command via
+    # T -> Ctrl+V -> Enter. Defaults match the "find a tree, mine it, repeat"
+    # loop the user wants for unattended training.
+    # Chat commands that run ONCE at the very first reset of a training
+    # session. Use this for one-shot world setup like enabling immediate
+    # respawn or setting the agent's spawn point.
+    init_chat_commands: tuple[str, ...] = ()
+
+    # Chat commands that run AFTER the death screen is dismissed on a
+    # timeout reset. Use for things /kill wipes that need re-applying once
+    # the player is back in the world (effect buffs, gamemode, etc.).
+    # Only fires on timeouts — keeps normal "got a log" terminate-resets
+    # cheap.
+    post_respawn_chat_commands: tuple[str, ...] = ()
+
+    auto_reset_chat_commands: tuple[str, ...] = ("/clear @s",)
+    # When the agent times out without acquiring a log, run *these* commands
+    # in addition to ``auto_reset_chat_commands``. Use this for a "harder"
+    # reset (e.g. teleport back to spawn) when the agent has wandered into
+    # an uninteresting part of the world.
+    timeout_extra_chat_commands: tuple[str, ...] = ()
+    # Wall-clock pause AFTER chat commands run, so the player can finish
+    # respawning / re-entering control before the new episode starts.
+    post_reset_pause_s: float = 0.5
+    # Watchdog: at every reset(), re-detect the MC window. If it moved, the
+    # capture region is updated. If MC is gone (alt-tabbed away, minimized,
+    # crashed) the env busy-waits with a loud warning until either MC
+    # reappears or the failsafe trips. Without this, a 4h run can silently
+    # train on a frozen desktop frame.
+    require_window_each_reset: bool = True
+    window_watchdog_poll_s: float = 1.0
+    fovea_log_pixel_norm: int = 4000  # divisor for fovea-pixel shaping (capped at 1.0)
+    reward_step_penalty: float = -0.005
+    reward_aim_dense: float = 0.5     # max per-step reward for log-colored pixels in fovea
+    reward_attack_when_aimed: float = 1.0  # bonus per step for forward_attack while aimed
+    reward_log_acquired: float = 25.0  # sparse reward for getting a log
+    aimed_threshold_frac: float = 0.05  # fovea log-px fraction above this counts as "aimed"
+    hotbar: HotbarSpec | None = None  # if set, overrides auto computation
+    fovea: FoveaSpec = field(default_factory=FoveaSpec)
+
+
+class MinecraftRealEnv(gym.Env):
+    """Gymnasium env over the real Minecraft Java client (Windows-only).
+
+    Observations: ``uint8`` ``(H, W, 3)`` RGB at ``cfg.obs_shape``.
+    Actions: ``Discrete(8)`` — see ``ACTION_NAMES``.
+    """
+
+    metadata = {"render_modes": ["rgb_array"], "render_fps": 20}
+
+    def __init__(
+        self,
+        config: MinecraftRealConfig | None = None,
+        *,
+        render_mode: str | None = None,
+    ) -> None:
+        super().__init__()
+        self.cfg = config or MinecraftRealConfig()
+        self.render_mode = render_mode
+
+        h, w = self.cfg.obs_shape
+        self.observation_space = spaces.Box(
+            low=0, high=255, shape=(h, w, 3), dtype=np.uint8
+        )
+        self.action_space = spaces.Discrete(NUM_ACTIONS)
+
+        log_low, log_high = get_bgr_range("logs")
+        self._log_low = np.array(log_low, dtype=np.uint8)
+        self._log_high = np.array(log_high, dtype=np.uint8)
+
+        # Lazily configure the input backend (Windows SendInput).
+        self._input_impl = ginput.configure("auto")
+
+        # Held state: True means "currently held down" so we only emit
+        # transitions when the desired held-state changes.
+        self._held: dict[str, bool] = {
+            "w": False,
+            "lmb": False,
+            "space": False,
+        }
+
+        self._sct: mss.mss | None = None
+        self._monitor: dict | None = None
+        self._mc_window: WindowRegion | None = None
+        self._capture_source: str = "unknown"
+        self._hotbar: HotbarSpec | None = None
+        self._fovea: tuple[int, int, int, int] | None = None
+
+        self._episode_start: float | None = None
+        self._steps: int = 0
+        self._logs_collected: int = 0
+        self._had_log_last_step: bool = False
+        self._slot_empty_baseline: int = 0
+        self._effective_log_threshold: int = int(self.cfg.log_pixel_threshold)
+        self._slot_empty_frame: np.ndarray | None = None
+        self._reset_due_to_timeout: bool = False
+        # First-reset flag: triggers the one-shot ``init_chat_commands``.
+        self._init_done: bool = False
+        self._last_obs: np.ndarray | None = None
+        # Full-resolution BGR frame from the most recent step(). Exposed
+        # so callbacks can dump high-quality screenshots on log_acquired
+        # without paying to grab a fresh frame.
+        self._last_full_frame: np.ndarray | None = None
+        # Ring buffer of small downsampled frames for the frame-diff
+        # curiosity reward. Stored at obs resolution so the diff is cheap.
+        self._obs_history: list[np.ndarray] = []
+        # Tracks fraction of full-frame pixels matching the log BGR range,
+        # used by the "approaching wood" (delta) reward. Reset to the
+        # initial-frame fraction in reset() so the very first step's delta
+        # isn't a spurious +reward.
+        self._prev_full_frame_log_frac: float = 0.0
+
+    # ---- core helpers -----------------------------------------------------
+
+    def _ensure_capture(self) -> None:
+        cfg = self.cfg
+        if self._sct is None:
+            self._sct = mss.mss()
+        if self._monitor is None:
+            if cfg.use_window_detection:
+                region = find_minecraft_window(
+                    title_substr=cfg.window_title_substr
+                )
+                if region is not None:
+                    self._mc_window = region
+                    self._monitor = region.as_mss_monitor()
+                    self._capture_source = (
+                        f"window:{region.title!r}@{region.left},{region.top}"
+                    )
+            if self._monitor is None:
+                self._monitor = self._sct.monitors[cfg.monitor_index]
+                self._capture_source = f"monitor:{cfg.monitor_index}"
+            mw = int(self._monitor["width"])
+            mh = int(self._monitor["height"])
+            if cfg.hotbar is not None:
+                self._hotbar = cfg.hotbar
+            else:
+                self._hotbar = HotbarSpec.from_monitor(
+                    mw, mh, slot=1, gui_scale=cfg.gui_scale
+                )
+            self._fovea = cfg.fovea.rect(mw, mh)
+
+    def _refresh_window_or_wait(self) -> None:
+        """Re-detect the MC window each reset and update the capture region.
+
+        If MC's window can't be found at all, busy-wait (printing a warning
+        every poll) until it comes back, the failsafe trips, or the user
+        kills the process. Without this watchdog, alt-tabbing away or
+        minimizing MC silently causes the env to capture a stale/garbage
+        region — which is exactly how v11 spent 25 minutes "training" on a
+        frozen desktop frame.
+        """
+        cfg = self.cfg
+        if not cfg.require_window_each_reset or not cfg.use_window_detection:
+            return
+        warned = False
+        while True:
+            try:
+                region = find_minecraft_window(
+                    title_substr=cfg.window_title_substr
+                )
+            except (OSError, RuntimeError):
+                region = None
+            if region is not None:
+                if (
+                    self._mc_window is None
+                    or region.left != self._mc_window.left
+                    or region.top != self._mc_window.top
+                    or region.width != self._mc_window.width
+                    or region.height != self._mc_window.height
+                ):
+                    self._mc_window = region
+                    self._monitor = region.as_mss_monitor()
+                    mw = int(self._monitor["width"])
+                    mh = int(self._monitor["height"])
+                    if cfg.hotbar is not None:
+                        self._hotbar = cfg.hotbar
+                    else:
+                        self._hotbar = HotbarSpec.from_monitor(
+                            mw, mh, slot=1, gui_scale=cfg.gui_scale
+                        )
+                    self._fovea = cfg.fovea.rect(mw, mh)
+                    if warned:
+                        print(
+                            "  [watchdog] Minecraft window is back: "
+                            f"{region.left},{region.top} "
+                            f"{region.width}x{region.height} -- resuming."
+                        )
+                return
+            if not warned:
+                print(
+                    "  [watchdog] WARN: no Minecraft window found. "
+                    "Bring MC to the foreground (alt-tab to it). "
+                    "Training is paused; press F12 to abort."
+                )
+                warned = True
+            if _failsafe.is_stopping():
+                return
+            time.sleep(cfg.window_watchdog_poll_s)
+
+    def _grab_full_bgr(self) -> np.ndarray:
+        assert self._sct is not None and self._monitor is not None
+        raw = np.array(self._sct.grab(self._monitor))
+        return cv2.cvtColor(raw, cv2.COLOR_BGRA2BGR)
+
+    def _make_obs(self, frame_bgr: np.ndarray) -> np.ndarray:
+        h, w = self.cfg.obs_shape
+        small = cv2.resize(frame_bgr, (w, h), interpolation=cv2.INTER_AREA)
+        return cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+
+    def _log_mask(self, frame_bgr: np.ndarray) -> np.ndarray:
+        return cv2.inRange(frame_bgr, self._log_low, self._log_high)
+
+    def _slot_crop(self, frame_bgr: np.ndarray) -> np.ndarray:
+        assert self._hotbar is not None
+        hb = self._hotbar
+        return frame_bgr[hb.y : hb.y + hb.h, hb.x : hb.x + hb.w]
+
+    def _log_pixels_in_slot(self, frame_bgr: np.ndarray) -> int:
+        slot = self._slot_crop(frame_bgr)
+        if slot.size == 0:
+            return 0
+        return int(self._log_mask(slot).sum() // 255)
+
+    def _slot_diff_from_empty(self, frame_bgr: np.ndarray) -> float:
+        """Mean BGR distance between the current slot ROI and the empty-slot
+        snapshot taken at reset. Returns 0.0 if no baseline has been captured.
+        """
+        if self._slot_empty_frame is None:
+            return 0.0
+        slot = self._slot_crop(frame_bgr)
+        if slot.size == 0 or slot.shape != self._slot_empty_frame.shape:
+            return 0.0
+        return float(cv2.absdiff(slot, self._slot_empty_frame).mean())
+
+    def _log_pixel_frac_fovea(self, frame_bgr: np.ndarray) -> float:
+        assert self._fovea is not None
+        x, y, w, h = self._fovea
+        patch = frame_bgr[y : y + h, x : x + w]
+        if patch.size == 0:
+            return 0.0
+        m = self._log_mask(patch)
+        return float(m.mean()) / 255.0
+
+    def _log_pixel_frac_full(self, frame_bgr: np.ndarray) -> float:
+        """Fraction of *world-view* pixels matching the log BGR range.
+
+        Excludes the bottom 10% of the frame so the hotbar (which always
+        contains log-colored UI once the agent picks up wood) doesn't
+        permanently inflate the visible-log reward and trap the policy
+        into "do nothing once you have wood".
+        """
+        if frame_bgr.size == 0:
+            return 0.0
+        h = frame_bgr.shape[0]
+        cutoff = int(h * 0.9)
+        world = frame_bgr[:cutoff]
+        if world.size == 0:
+            return 0.0
+        return float(self._log_mask(world).mean()) / 255.0
+
+    # ---- input application ------------------------------------------------
+
+    def _set_held(self, key: str, want: bool) -> None:
+        if self._held.get(key) == want:
+            return
+        self._held[key] = want
+        if key == "lmb":
+            ginput.mouse_left(want)
+        elif key in ("w", "space"):
+            (ginput.key_down if want else ginput.key_up)(key)
+        else:
+            raise KeyError(key)
+
+    def _release_movement_and_attack(self) -> None:
+        self._set_held("w", False)
+        self._set_held("lmb", False)
+        self._set_held("space", False)
+
+    def _run_reset_chat_commands(self, *, timed_out: bool) -> None:
+        # NOTE: ``timeout_extra_chat_commands`` are NOT run here; they run at
+        # the end of ``step()`` when truncation fires, so the death-screen
+        # transition has already begun by the time reset() is called. If we
+        # ran /kill @s here, the very next ``_grab_full_bgr()`` (the
+        # baseline-frame grab below) would capture the death screen as the
+        # "empty slot" reference, poisoning the diff detector.
+        del timed_out  # kept in signature for callers / future use
+        cfg = self.cfg
+        cmds: list[str] = list(cfg.auto_reset_chat_commands)
+        if not cmds:
+            return
+        for cmd in cmds:
+            try:
+                ginput.chat_command(cmd)
+            except (OSError, RuntimeError):
+                # Don't let a transient SendInput hiccup take down training.
+                pass
+
+    def _run_truncate_chat_commands(self) -> None:
+        """Run the timeout chat commands at episode truncation.
+
+        Runs INSIDE ``step()`` right before returning the truncated
+        transition, so by the time the next ``reset()`` fires the player
+        is already on the death screen / mid-respawn. This keeps the
+        baseline frame for the diff detector clean (it's grabbed AFTER
+        we dismiss the death screen, with the player back in the world).
+        """
+        cfg = self.cfg
+        for cmd in cfg.timeout_extra_chat_commands:
+            try:
+                ginput.chat_command(cmd)
+            except (OSError, RuntimeError):
+                pass
+
+    def _dismiss_death_screen(self) -> None:
+        """Respawn after death. Re-detects MC window EVERY call.
+
+        Strategy, in order:
+          1. Re-find the MC window fresh (don't trust ``_mc_window`` —
+             MC may have been moved, resized, or briefly lost focus
+             since capture started). If detection fails, abort: a click
+             at a stale coordinate is exactly the failure mode that
+             clicked Cursor's tab bar in v6.
+          2. Force MC to the foreground via ``SetForegroundWindow``.
+             The Enter key and the click below only mean anything if
+             MC is actually receiving them.
+          3. Press Enter. On every modern MC version the Respawn button
+             is the highlighted button on the death screen, and Enter
+             activates the highlighted button without any coordinate
+             math. This is the cheapest, most reliable path.
+          4. As a backup: move the OS cursor to the computed button
+             center inside the MC window and click. The math is
+             ``window_h/2 + 10 * gui_scale`` from the top of the
+             client area (DeathScreen.java places the button at GUI
+             ``(W/2 - 100, H/2, 200, 20)``). Print the coords so the
+             user can sanity-check them in the run log.
+          5. Press Enter once more — covers the case where the click
+             landed on the Respawn button but Windows ate the click
+             due to focus stealing during the foreground transition.
+        """
+        from mine_diamonds.capture import find_minecraft_window  # local import; avoids hard win32 dep at module load
+
+        region = find_minecraft_window()
+        if region is None:
+            print(
+                "  [dismiss] WARN: no Minecraft window found; falling "
+                "back to Enter key only.",
+                flush=True,
+            )
+            try:
+                ginput.key_down("enter")
+                time.sleep(0.04)
+                ginput.key_up("enter")
+            except (OSError, RuntimeError):
+                pass
+            return
+
+        # Cache the freshly-detected region so subsequent capture also
+        # uses it. (If the window moved, this self-heals capture.)
+        self._mc_window = region
+        self._monitor = region.as_mss_monitor()
+
+        # Bring MC to the foreground before sending input.
+        try:
+            from mine_diamonds.capture import focus_window_by_title
+
+            focus_window_by_title()
+        except (OSError, RuntimeError, ImportError):
+            pass
+        time.sleep(0.08)
+
+        # 3) Enter (the cheap, coord-free path).
+        try:
+            ginput.key_down("enter")
+            time.sleep(0.04)
+            ginput.key_up("enter")
+        except (OSError, RuntimeError):
+            pass
+        time.sleep(0.18)
+
+        # 4) Backup click on the literal button center.
+        cx = int(region.left + region.width // 2)
+        cy = int(region.top + region.height // 2 + 10 * int(self.cfg.gui_scale))
+        # Sanity: the click must fall INSIDE the detected MC window. If
+        # somehow it doesn't, refuse to click — better to skip the dismiss
+        # than to click on whatever's behind MC (Cursor tab, browser, etc).
+        in_x = region.left <= cx <= region.left + region.width
+        in_y = region.top <= cy <= region.top + region.height
+        print(
+            f"  [dismiss] mc_window=({region.left},{region.top},"
+            f"{region.width}x{region.height}) "
+            f"click=({cx},{cy}) inside={in_x and in_y}",
+            flush=True,
+        )
+        if in_x and in_y:
+            try:
+                ginput.click_at(cx, cy, button="left", hold_ms=80)
+            except (OSError, RuntimeError):
+                pass
+        time.sleep(0.1)
+
+        # 5) One more Enter for good measure.
+        try:
+            ginput.key_down("enter")
+            time.sleep(0.04)
+            ginput.key_up("enter")
+        except (OSError, RuntimeError):
+            pass
+
+    def _apply_action(self, action: int) -> None:
+        cfg = self.cfg
+        if action == NOOP:
+            self._release_movement_and_attack()
+        elif action == FORWARD:
+            self._set_held("w", True)
+            self._set_held("lmb", False)
+            self._set_held("space", False)
+        elif action == YAW_LEFT:
+            self._release_movement_and_attack()
+            ginput.move_rel(-cfg.yaw_step_px, 0)
+        elif action == YAW_RIGHT:
+            self._release_movement_and_attack()
+            ginput.move_rel(cfg.yaw_step_px, 0)
+        elif action == PITCH_UP:
+            self._release_movement_and_attack()
+            ginput.move_rel(0, -cfg.pitch_step_px)
+        elif action == PITCH_DOWN:
+            self._release_movement_and_attack()
+            ginput.move_rel(0, cfg.pitch_step_px)
+        elif action == FORWARD_ATTACK:
+            self._set_held("w", True)
+            self._set_held("lmb", True)
+            self._set_held("space", False)
+        elif action == FORWARD_JUMP:
+            # Hold W + Space. In MC, holding Space while walking auto-jumps
+            # whenever the player tries to walk into a 1-block rise, so this
+            # is exactly what the agent needs to scale terrain while looking
+            # for trees. LMB stays released so we don't break leaves on
+            # sapling tops while bunny-hopping.
+            self._set_held("w", True)
+            self._set_held("space", True)
+            self._set_held("lmb", False)
+        else:
+            raise ValueError(f"invalid action {action}")
+
+    # ---- gymnasium API ----------------------------------------------------
+
+    def reset(
+        self,
+        *,
+        seed: int | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        super().reset(seed=seed)
+        self._ensure_capture()
+        self._refresh_window_or_wait()
+        self._release_movement_and_attack()
+        # Make sure MC is the foreground window before we start sending
+        # chat commands or Enter presses. If the user's focus drifted to
+        # Cursor / Discord / a browser between the countdown and the first
+        # reset, our keystrokes would land on the wrong app and the agent
+        # would never receive its init buffs.
+        try:
+            from mine_diamonds.capture import focus_window_by_title
+
+            focus_window_by_title()
+        except (OSError, RuntimeError, ImportError):
+            pass
+        time.sleep(0.08)
+        # ALWAYS try to dismiss any blocking UI screen at reset, not just on
+        # timeouts. Why: even outside the truncate-on-timeout path, the agent
+        # can land on the death screen via two routes that bit us in v8:
+        #   (a) gameplay death (fall, lava, mob) the env doesn't know about
+        #   (b) the death-screen overlay covers slot 1, the slot-diff
+        #       detector reads "different from empty" and terminates the
+        #       episode as if a log was acquired.
+        # In either case, the next reset() inherits a death-screen frame.
+        # The Enter key is a no-op in normal world view (it's not bound by
+        # default in MC Java) but activates the highlighted Respawn button
+        # on the death screen, so it's safe to send unconditionally.
+        timed_out = bool(self._reset_due_to_timeout)
+        # Run one-shot init commands on the very first reset of training.
+        # (e.g. "/gamerule doImmediateRespawn true", "/effect give @s
+        # minecraft:resistance ...") — these set up world state we want to
+        # hold for the entire run.
+        if not self._init_done:
+            for cmd in self.cfg.init_chat_commands:
+                try:
+                    ginput.chat_command(cmd)
+                except (OSError, RuntimeError):
+                    pass
+            self._init_done = True
+        if timed_out:
+            time.sleep(0.7)  # let the death screen render fully
+            self._dismiss_death_screen()
+            time.sleep(0.5)
+            self._dismiss_death_screen()
+            time.sleep(0.7)  # let the respawn animation finish
+            # Now that the player is alive again, re-apply anything /kill
+            # cleared (effect buffs, gamemode, etc.). This is the ONLY
+            # place these commands run on subsequent episodes; keeping
+            # them out of ``auto_reset_chat_commands`` is what stopped
+            # the chat-spam death loop in v10.
+            for cmd in self.cfg.post_respawn_chat_commands:
+                try:
+                    ginput.chat_command(cmd)
+                except (OSError, RuntimeError):
+                    pass
+        else:
+            # Cheap unconditional Enter — clears a stuck UI screen that
+            # snuck through (false-positive log_acquired on the death-
+            # overlay, gameplay death, etc.).
+            try:
+                ginput.key_down("enter")
+                time.sleep(0.04)
+                ginput.key_up("enter")
+            except (OSError, RuntimeError):
+                pass
+            time.sleep(0.2)
+        # In-game soft reset: clear inventory (and optionally teleport) via
+        # MC chat. Keeps the reward signal alive across episodes — without
+        # this, slot 1 stays full of wood after the first success and the
+        # diff detector stops firing.
+        self._run_reset_chat_commands(timed_out=timed_out)
+        self._reset_due_to_timeout = False
+        if self.cfg.post_reset_pause_s > 0:
+            time.sleep(self.cfg.post_reset_pause_s)
+        frame = self._grab_full_bgr()
+        obs = self._make_obs(frame)
+        self._last_obs = obs
+
+        # Snapshot the empty-slot ROI as the reference for the diff detector,
+        # and snapshot the empty-slot pixel count for the legacy detector.
+        # CALLER MUST: open MC, focus the world (NOT inventory), make sure
+        # slot 1 is empty before reset(). If slot 1 is already full, every
+        # episode starts with logs_collected=1 and terminates immediately.
+        cfg = self.cfg
+        slot = self._slot_crop(frame)
+        if slot.size > 0:
+            self._slot_empty_frame = slot.copy()
+        else:
+            self._slot_empty_frame = None
+        slot_px = self._log_pixels_in_slot(frame)
+        if cfg.auto_baseline_log_threshold:
+            self._slot_empty_baseline = int(slot_px)
+            self._effective_log_threshold = int(
+                max(
+                    cfg.log_pixel_threshold,
+                    slot_px + cfg.log_pixel_baseline_margin,
+                )
+            )
+        else:
+            self._slot_empty_baseline = 0
+            self._effective_log_threshold = int(cfg.log_pixel_threshold)
+
+        # We just snapshotted the empty slot, so by definition diff = 0 here.
+        # Slot is empty by assumption; if it isn't, nothing the env can do.
+        had_log_now = False
+        self._had_log_last_step = had_log_now
+        self._logs_collected = 0
+        self._episode_start = time.perf_counter()
+        self._steps = 0
+        self._obs_history = [obs.copy()]
+        # Initialize the approach-reward baseline to whatever's visible at
+        # episode start so the first step's delta is ~0. Without this, an
+        # agent that respawns next to a tree would get a huge bogus +reward
+        # for "approaching" on step 1.
+        self._prev_full_frame_log_frac = self._log_pixel_frac_full(frame)
+        info = {
+            "had_log_at_reset": had_log_now,
+            "slot_empty_baseline_px": int(self._slot_empty_baseline),
+            "effective_log_threshold": int(self._effective_log_threshold),
+            "slot_diff_threshold": float(cfg.slot_diff_threshold),
+            "use_slot_diff_detector": bool(cfg.use_slot_diff_detector),
+            "hotbar_rect": (
+                self._hotbar.x, self._hotbar.y, self._hotbar.w, self._hotbar.h
+            ) if self._hotbar else None,
+        }
+        return obs, info
+
+    def step(
+        self, action: int
+    ) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
+        if self._episode_start is None:
+            raise RuntimeError("step() called before reset()")
+        cfg = self.cfg
+        step_start = time.perf_counter()
+
+        # Failsafe: F12 / Pause / stop-file pressed. The watcher already
+        # released keys, but skip applying any new action and truncate
+        # this episode so the SB3 callback can stop training cleanly.
+        if _failsafe.is_stopping():
+            self._release_movement_and_attack()
+            frame = self._grab_full_bgr() if self._sct is not None else np.zeros(
+                (self.cfg.obs_shape[0], self.cfg.obs_shape[1], 3), dtype=np.uint8
+            )
+            obs = self._make_obs(frame) if frame.size else self._last_obs
+            if obs is None:
+                obs = np.zeros(
+                    (self.cfg.obs_shape[0], self.cfg.obs_shape[1], 3),
+                    dtype=np.uint8,
+                )
+            info = {
+                "elapsed_s": float(time.perf_counter() - self._episode_start),
+                "fovea_log_frac": 0.0,
+                "slot_log_px": 0,
+                "slot_diff": 0.0,
+                "have_log_now": False,
+                "log_acquired": False,
+                "logs_collected": int(self._logs_collected),
+                "aimed": False,
+                "action_name": ACTION_NAMES[int(action)],
+                "failsafe_stop": True,
+            }
+            return obs, 0.0, False, True, info
+
+        # Sticky actions / frame skip. Each call to env.step() applies the
+        # chosen action ``action_repeat`` times, sleeping ``frame_time_s``
+        # between each application. For mouse-delta actions (yaw/pitch)
+        # the deltas accumulate visibly: a single YAW_LEFT decision with
+        # action_repeat=4 and yaw_step_px=60 sweeps the camera by ~240
+        # mickeys before the agent gets to choose again. For held keys
+        # (W, Space, LMB) the second-onwards _set_held calls are no-ops, so
+        # the keys simply stay pressed across the substeps — which is also
+        # what we want for sustained movement / attack.
+        n_repeats = max(1, int(cfg.action_repeat))
+        # Bail out of repeats early if the failsafe fires mid-step. We've
+        # already passed the gate above but the user could press F12 during
+        # a 200ms substep window; checking each repeat keeps response time
+        # under ~50 ms.
+        for r in range(n_repeats):
+            if _failsafe.is_stopping():
+                break
+            self._apply_action(int(action))
+            target_elapsed = (r + 1) * cfg.frame_time_s
+            elapsed_so_far = time.perf_counter() - step_start
+            sleep_for = target_elapsed - elapsed_so_far
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+
+        frame = self._grab_full_bgr()
+        obs = self._make_obs(frame)
+        self._last_obs = obs
+        self._last_full_frame = frame
+
+        slot_log_px = self._log_pixels_in_slot(frame)
+        slot_diff = self._slot_diff_from_empty(frame)
+        if cfg.use_slot_diff_detector and self._slot_empty_frame is not None:
+            have_log_now = slot_diff >= cfg.slot_diff_threshold
+        else:
+            have_log_now = slot_log_px >= self._effective_log_threshold
+        fovea_log_frac = self._log_pixel_frac_fovea(frame)
+        full_log_frac = self._log_pixel_frac_full(frame)
+        aimed = fovea_log_frac >= cfg.aimed_threshold_frac
+
+        # ---- reward ------------------------------------------------------
+        reward = float(cfg.reward_step_penalty)
+
+        # 1) "I can see wood" — per-step reward for log pixels visible
+        #    ANYWHERE in the world view. Fires the moment a tree edges
+        #    into peripheral view, so the policy gets a clean gradient
+        #    while rotating toward visible wood. Hotbar region is
+        #    excluded inside `_log_pixel_frac_full` so this doesn't pin
+        #    high once the agent has wood in inventory.
+        sat_v = max(1e-6, cfg.log_visible_saturation_frac)
+        log_visible_norm = min(1.0, full_log_frac / sat_v)
+        reward += cfg.reward_log_visible_max * log_visible_norm
+
+        # 2) "I'm approaching the wood" — per-step reward for the increase
+        #    in visible-log fraction vs. the previous step. Rewards
+        #    walking toward / yawing toward visible trees. Negative
+        #    deltas (wood leaving view) get zero, not a penalty, so the
+        #    agent isn't punished for losing a tree it's actively
+        #    chopping (which shrinks as it falls).
+        delta_full = full_log_frac - self._prev_full_frame_log_frac
+        approach_reward = 0.0
+        if delta_full > 0:
+            sat_a = max(1e-6, cfg.log_approach_saturation_delta)
+            approach_reward = (
+                cfg.reward_log_approach_max * min(1.0, delta_full / sat_a)
+            )
+            reward += approach_reward
+        self._prev_full_frame_log_frac = full_log_frac
+
+        # 3) "I'm aimed at it" — fovea-coverage reward. Capped so standing
+        #    right inside a tree doesn't pin the reward at huge values forever.
+        reward += cfg.reward_aim_dense * min(1.0, fovea_log_frac * 4.0)
+
+        # 4) "I'm attacking it" — extra reward for swinging when aimed.
+        if action == FORWARD_ATTACK and aimed:
+            reward += cfg.reward_attack_when_aimed
+
+        # 5) Tiebreaker exploration shaping: when no log is visible, very
+        #    small bonus for looking around or walking. These are dwarfed
+        #    by the visible/approach rewards so they only matter in the
+        #    "literally cannot see any wood" regime.
+        if fovea_log_frac < cfg.explore_blind_threshold:
+            if action in (YAW_LEFT, YAW_RIGHT):
+                reward += cfg.reward_explore_yaw_when_blind
+            elif action in (FORWARD, FORWARD_ATTACK, FORWARD_JUMP):
+                reward += cfg.reward_explore_forward_when_blind
+
+        # 6) Curiosity / frame-diff shaping: tiny bonus for visual change
+        #    vs. the observation ``frame_diff_lookback_steps`` ago. Just
+        #    enough to favor moving the camera over staring at a wall.
+        frame_diff = 0.0
+        if self._obs_history:
+            ref = self._obs_history[0]
+            if ref.shape == obs.shape:
+                frame_diff = float(cv2.absdiff(obs, ref).mean())
+        diff_norm = min(1.0, frame_diff / max(1e-6, cfg.frame_diff_saturation))
+        reward += cfg.reward_frame_diff_max * diff_norm
+        self._obs_history.append(obs)
+        if len(self._obs_history) > cfg.frame_diff_lookback_steps:
+            self._obs_history.pop(0)
+
+        # Sparse: log just appeared in the hotbar slot.
+        log_acquired = bool(have_log_now and not self._had_log_last_step)
+        if log_acquired:
+            reward += cfg.reward_log_acquired
+            self._logs_collected += 1
+        self._had_log_last_step = have_log_now
+
+        self._steps += 1
+        elapsed = time.perf_counter() - self._episode_start
+        terminated = self._logs_collected >= cfg.logs_to_succeed
+        truncated = (not terminated) and (elapsed >= cfg.max_seconds)
+        if terminated or truncated:
+            self._release_movement_and_attack()
+        if truncated:
+            self._reset_due_to_timeout = True
+            # Fire the timeout chat commands NOW (e.g. /clear @s,
+            # /kill @e[type=item], /kill @s). Running them here — not in
+            # reset() — means by the time reset() takes its baseline frame
+            # the player is already past the death screen, so the empty-slot
+            # snapshot is clean. Order matters: clear inventory first so
+            # /kill @s drops nothing, then sweep stray drops, then kill.
+            self._run_truncate_chat_commands()
+
+        info = {
+            "elapsed_s": float(elapsed),
+            "fovea_log_frac": float(fovea_log_frac),
+            "full_log_frac": float(full_log_frac),
+            "log_approach_reward": float(approach_reward),
+            "slot_log_px": int(slot_log_px),
+            "slot_diff": float(slot_diff),
+            "slot_empty_baseline_px": int(self._slot_empty_baseline),
+            "effective_log_threshold": int(self._effective_log_threshold),
+            "slot_diff_threshold": float(cfg.slot_diff_threshold),
+            "have_log_now": bool(have_log_now),
+            "log_acquired": log_acquired,
+            "logs_collected": int(self._logs_collected),
+            "aimed": bool(aimed),
+            "frame_diff": float(frame_diff),
+            "action_name": ACTION_NAMES[int(action)],
+        }
+        return obs, float(reward), bool(terminated), bool(truncated), info
+
+    def render(self) -> np.ndarray | None:
+        if self._last_obs is None:
+            return None
+        return self._last_obs
+
+    def close(self) -> None:
+        try:
+            self._release_movement_and_attack()
+        except Exception:
+            pass
+        if self._sct is not None:
+            try:
+                self._sct.close()
+            except Exception:
+                pass
+            self._sct = None
+            self._monitor = None

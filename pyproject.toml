@@ -19,6 +19,8 @@ minecraft-demo = [
   "keyboard>=0.13.5",
   "mss>=9.0.0",
   "opencv-python>=4.8.0",
+  "tensorboard>=2.15",
+  "matplotlib>=3.8.0",
 ]
 
 [tool.setuptools.packages.find]
