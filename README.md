@@ -4,9 +4,9 @@
 
 | Doc | What it’s for |
 |-----|----------------|
-| [`LIGHTNING_TALK.md`](LIGHTNING_TALK.md) | Talk narrative: stack, failure modes, metrics |
 | [`DEMO.md`](DEMO.md) | On-stage checklist (smoke test + scripted demo) |
 | [`docs/PRESENTATION_DATA.md`](docs/PRESENTATION_DATA.md) | **Figures & JSONL for papers/slides** — what to export, how to regenerate |
+| [`docs/PAPER_RESULTS_ASSETS.md`](docs/PAPER_RESULTS_ASSETS.md) | Ready-to-use figure/table list for the final report |
 
 ```
 RL (real MC)                    Scripted (after)

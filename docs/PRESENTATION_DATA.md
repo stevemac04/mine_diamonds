@@ -39,8 +39,8 @@ PPO diagnostics, CSV).
 
 ## Slides and narrative
 
-- `LIGHTNING_TALK.md` — story and engineering lessons
 - `DEMO.md` — live demo checklist (scripted + optional RL monitoring)
+- `docs/PAPER_RESULTS_ASSETS.md` — figure/table index for report and slides
 
 ## TensorBoard (live)
 

@@ -143,6 +143,29 @@ def main() -> int:
                    help="If we've been APPROACHing for a while with no "
                         "growth in fovea fraction, hop. Helps over fences "
                         "and 1-block rises.")
+    p.add_argument("--acquire-confirm-frames", type=int, default=3,
+                   help="Require this many consecutive ticks with slot_diff "
+                        "above threshold before counting a mined log.")
+    p.add_argument("--min-mine-seconds", type=float, default=1.0,
+                   help="Require spending at least this many seconds in MINE "
+                        "before slot-diff can count as acquired.")
+    p.add_argument("--acquire-margin", type=float, default=2.0,
+                   help="Extra margin added to slot_diff_threshold to avoid "
+                        "single-frame false positives from UI/lighting.")
+    p.add_argument("--mine-commit-seconds", type=float, default=1.4,
+                   help="Once MINE starts, keep holding W+LMB for at least "
+                        "this long before allowing center-corrections. "
+                        "Prevents jittery MINE<->CENTER flapping.")
+    p.add_argument("--acquire-log-px-min", type=int, default=80,
+                   help="Also require at least this many log-colored pixels "
+                        "inside slot 1 before counting acquisition. Helps "
+                        "ignore apple/seed pickups that change slot diff.")
+    p.add_argument("--mine-exit-fovea-frac", type=float, default=0.015,
+                   help="While in MINE, stay committed as long as fovea log "
+                        "fraction is above this value.")
+    p.add_argument("--mine-exit-blind-frames", type=int, default=8,
+                   help="Require this many consecutive near-blind frames "
+                        "before leaving MINE.")
     p.add_argument("--no-immortal", action="store_true",
                    help="Skip the resistance/regen/etc. setup commands. "
                         "Use only if you're already invincible or want a "
@@ -197,7 +220,16 @@ def main() -> int:
 
     obs, reset_info = env.reset()
     diff_thresh = float(reset_info.get("slot_diff_threshold", 8.0))
-    print(f"reset done. slot_diff_threshold={diff_thresh:.1f}\n")
+    slot_log_px_thresh = int(reset_info.get("effective_log_threshold", args.acquire_log_px_min))
+    slot_log_px_thresh = max(int(args.acquire_log_px_min), min(slot_log_px_thresh, 220))
+    acquire_thresh = diff_thresh + float(args.acquire_margin)
+    print(
+        f"reset done. slot_diff_threshold={diff_thresh:.1f}, "
+        f"acquire_thresh={acquire_thresh:.1f}, "
+        f"slot_log_px_thresh={slot_log_px_thresh}, "
+        f"confirm_frames={int(args.acquire_confirm_frames)}, "
+        f"min_mine_s={float(args.min_mine_seconds):.1f}\n"
+    )
 
     held = HeldState()
     tick_dt = 1.0 / max(1.0, args.tick_hz)
@@ -206,12 +238,16 @@ def main() -> int:
     chop_target = target_logs
     state = "SCAN"
     state_started_at = time.perf_counter()
+    mine_started_at: float | None = None
+    mine_commit_until: float = 0.0
+    mine_blind_consec: int = 0
     last_fovea_at_state_start = 0.0
     sweep_start = time.perf_counter()
     deadline = time.perf_counter() + args.max_seconds
+    acquire_consec = 0
 
     def transition(new_state: str, fovea: float, full: float) -> None:
-        nonlocal state, state_started_at, last_fovea_at_state_start
+        nonlocal state, state_started_at, last_fovea_at_state_start, mine_started_at, mine_commit_until, mine_blind_consec, acquire_consec
         if new_state != state:
             print(
                 f"  [t={time.perf_counter() - sweep_start:5.1f}s] "
@@ -221,6 +257,13 @@ def main() -> int:
             state = new_state
             state_started_at = time.perf_counter()
             last_fovea_at_state_start = fovea
+            if new_state == "MINE":
+                mine_started_at = state_started_at
+                mine_commit_until = state_started_at + float(args.mine_commit_seconds)
+                mine_blind_consec = 0
+                acquire_consec = 0
+            else:
+                mine_started_at = None
 
     try:
         while logs_collected < chop_target:
@@ -243,13 +286,33 @@ def main() -> int:
             full_frac = env._log_pixel_frac_full(frame)  # type: ignore[attr-defined]
             fovea_frac = env._log_pixel_frac_fovea(frame)  # type: ignore[attr-defined]
             slot_diff = env._slot_diff_from_empty(frame)  # type: ignore[attr-defined]
+            slot_log_px = env._log_pixels_in_slot(frame)  # type: ignore[attr-defined]
 
-            if slot_diff >= diff_thresh:
+            # Robust acquisition gate: only count when we've truly been mining
+            # for a beat and slot diff is stable above threshold for multiple ticks.
+            mine_for_s = (
+                (time.perf_counter() - mine_started_at)
+                if (mine_started_at is not None and state == "MINE")
+                else 0.0
+            )
+            if slot_diff >= acquire_thresh:
+                acquire_consec += 1
+            else:
+                acquire_consec = 0
+
+            if (
+                state == "MINE"
+                and mine_for_s >= float(args.min_mine_seconds)
+                and acquire_consec >= max(1, int(args.acquire_confirm_frames))
+                and slot_log_px >= int(slot_log_px_thresh)
+            ):
                 logs_collected += 1
                 print(
                     f"  [t={time.perf_counter() - sweep_start:5.1f}s] "
                     f"LOG ACQUIRED #{logs_collected} "
-                    f"(slot_diff={slot_diff:.1f} >= {diff_thresh:.1f})"
+                    f"(slot_diff={slot_diff:.1f} >= {acquire_thresh:.1f}, "
+                    f"slot_log_px={slot_log_px} >= {slot_log_px_thresh}, "
+                    f"consec={acquire_consec}, mine_for={mine_for_s:.1f}s)"
                 )
                 held.release_all()
                 if logs_collected >= chop_target:
@@ -274,6 +337,9 @@ def main() -> int:
                     env._slot_empty_frame = fresh_slot.copy()  # type: ignore[attr-defined]
                 state = "MINE"  # keep chopping the same tree
                 state_started_at = time.perf_counter()
+                mine_started_at = state_started_at
+                mine_commit_until = state_started_at + float(args.mine_commit_seconds)
+                acquire_consec = 0
                 # Resume holding W + LMB right away.
                 held.set_w(True)
                 held.set_lmb(True)
@@ -296,11 +362,36 @@ def main() -> int:
 
             cx, cy, frac = ctr
             err_x = cx - 0.5
+            now = time.perf_counter()
+            in_mine_commit = (state == "MINE" and now < mine_commit_until)
+            if state == "MINE":
+                if fovea_frac <= float(args.mine_exit_fovea_frac):
+                    mine_blind_consec += 1
+                else:
+                    mine_blind_consec = 0
+            else:
+                mine_blind_consec = 0
+
+            # While in MINE, keep holding attack unless we've been truly blind
+            # for several consecutive frames. This prevents CENTER<->MINE
+            # flapping that interrupts block breaking.
+            if state == "MINE" and (
+                in_mine_commit
+                or mine_blind_consec < max(1, int(args.mine_exit_blind_frames))
+            ):
+                # Important: stand still while mining. Walking around once
+                # the log is centered causes needless jitter and can break
+                # line-of-sight to the same block. Hold only LMB.
+                held.set_w(False)
+                held.set_lmb(True)
+                held.set_space(False)
+                _sleep_remaining(tick_start, tick_dt)
+                continue
 
             # MINE: trunk is huge in the middle of the screen.
             if fovea_frac >= args.mine_fovea_frac and abs(err_x) < args.center_tol * 1.5:
                 transition("MINE", fovea_frac, full_frac)
-                held.set_w(True)
+                held.set_w(False)
                 held.set_lmb(True)
                 held.set_space(False)
                 _sleep_remaining(tick_start, tick_dt)
