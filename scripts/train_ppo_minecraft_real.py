@@ -430,6 +430,15 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--allow-kill-timeout",
+        action="store_true",
+        help=(
+            "Allow '/kill ...' timeout commands. Disabled by default because "
+            "death-screen timing is the most failure-prone reset path. "
+            "Without this flag, any timeout '/kill' commands are dropped."
+        ),
+    )
+    parser.add_argument(
         "--post-reset-pause-s",
         type=float,
         default=1.5,
@@ -474,6 +483,30 @@ def main() -> int:
             "added by --immortal is appended after these."
         ),
     )
+    parser.add_argument(
+        "--teacher-force-start",
+        type=float,
+        default=0.0,
+        help=(
+            "Hard-coded teacher override probability at step 0. "
+            "Set >0 (e.g. 0.7) to bootstrap tree-seeking behavior."
+        ),
+    )
+    parser.add_argument(
+        "--teacher-force-end",
+        type=float,
+        default=0.0,
+        help=(
+            "Teacher override probability after decay. Typical curriculum: "
+            "--teacher-force-start 0.7 --teacher-force-end 0.05"
+        ),
+    )
+    parser.add_argument(
+        "--teacher-force-decay-steps",
+        type=int,
+        default=10_000,
+        help="Number of env steps over which teacher forcing decays.",
+    )
     args = parser.parse_args()
 
     if args.reset_cmd is None:
@@ -481,6 +514,19 @@ def main() -> int:
     else:
         reset_cmds = tuple(c for c in args.reset_cmd if c)
     timeout_cmds: tuple[str, ...] = tuple(args.timeout_cmd or ())
+    if timeout_cmds and not args.allow_kill_timeout:
+        filtered = []
+        dropped = []
+        for cmd in timeout_cmds:
+            if cmd.strip().lower().startswith("/kill"):
+                dropped.append(cmd)
+            else:
+                filtered.append(cmd)
+        if dropped:
+            print("WARNING: dropping timeout kill commands (use --allow-kill-timeout to keep):")
+            for cmd in dropped:
+                print(f"  - {cmd}")
+        timeout_cmds = tuple(filtered)
 
     init_cmds: list[str] = list(args.init_cmd or ())
     post_respawn_cmds: list[str] = []
@@ -519,6 +565,9 @@ def main() -> int:
         auto_reset_chat_commands=reset_cmds,
         timeout_extra_chat_commands=timeout_cmds,
         post_reset_pause_s=float(args.post_reset_pause_s),
+        teacher_force_start=float(args.teacher_force_start),
+        teacher_force_end=float(args.teacher_force_end),
+        teacher_force_decay_steps=int(args.teacher_force_decay_steps),
     )
 
     run_dir = ROOT / "runs" / args.run_name
@@ -545,6 +594,11 @@ def main() -> int:
     print(f"  reset cmds      {list(cfg.auto_reset_chat_commands) or '<none>'}")
     print(f"  post-respawn    {list(cfg.post_respawn_chat_commands) or '<none>'}")
     print(f"  timeout cmds    {list(cfg.timeout_extra_chat_commands) or '<none>'}")
+    print(
+        "  teacher force  "
+        f"{cfg.teacher_force_start:.2f} -> {cfg.teacher_force_end:.2f} "
+        f"over {cfg.teacher_force_decay_steps} steps"
+    )
     print(f"  immortal mode   {bool(args.immortal)}")
     print()
 

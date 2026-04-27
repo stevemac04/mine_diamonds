@@ -226,6 +226,18 @@ class MinecraftRealConfig:
     # delta per agent step) earns ~half of the cap, giving a smooth pull.
     reward_log_approach_max: float = 0.80
     log_approach_saturation_delta: float = 0.01  # +1% of screen per step = max
+    # ---- teacher-assisted bootstrap -----------------------------------------
+    # Hard-coded tree-seeking controller that can override PPO actions early
+    # in training (teacher forcing), then gradually hand control back.
+    # This is a practical curriculum for sparse-reward real-MC training:
+    # pure random PPO often never reaches a tree often enough to learn.
+    teacher_force_start: float = 0.0   # 0 disables teacher forcing entirely
+    teacher_force_end: float = 0.0
+    teacher_force_decay_steps: int = 10_000
+    teacher_center_tol: float = 0.08
+    teacher_mine_fovea_frac: float = 0.06
+    teacher_blind_pitch_every: int = 8
+    teacher_pitch_recover_px: int = 18
     # ---- auto-reset (in-game) ------------------------------------------------
     # After every episode the env can run an in-game chat command via
     # T -> Ctrl+V -> Enter. Defaults match the "find a tree, mine it, repeat"
@@ -262,6 +274,9 @@ class MinecraftRealConfig:
     reward_step_penalty: float = -0.005
     reward_aim_dense: float = 0.5     # max per-step reward for log-colored pixels in fovea
     reward_attack_when_aimed: float = 1.0  # bonus per step for forward_attack while aimed
+    # Penalty for moving/turning while already aimed at wood but NOT attacking.
+    # This discourages the "find tree then strafe/yaw around it forever" loop.
+    penalty_move_when_aimed_not_attacking: float = -0.08
     reward_log_acquired: float = 25.0  # sparse reward for getting a log
     aimed_threshold_frac: float = 0.05  # fovea log-px fraction above this counts as "aimed"
     hotbar: HotbarSpec | None = None  # if set, overrides auto computation
@@ -338,6 +353,10 @@ class MinecraftRealEnv(gym.Env):
         # initial-frame fraction in reset() so the very first step's delta
         # isn't a spurious +reward.
         self._prev_full_frame_log_frac: float = 0.0
+        self._global_steps: int = 0
+        self._teacher_prev_fovea: float = 0.0
+        self._teacher_stuck_steps: int = 0
+        self._teacher_blind_steps: int = 0
 
     # ---- core helpers -----------------------------------------------------
 
@@ -487,6 +506,78 @@ class MinecraftRealEnv(gym.Env):
         if world.size == 0:
             return 0.0
         return float(self._log_mask(world).mean()) / 255.0
+
+    def _log_centroid(self, frame_bgr: np.ndarray) -> tuple[float, float] | None:
+        """Centroid of log-colored pixels in cropped world view, normalized [0,1]."""
+        if frame_bgr.size == 0:
+            return None
+        h, w = frame_bgr.shape[:2]
+        top = int(h * 0.05)
+        bot = int(h * 0.88)  # ignore hotbar + most of inventory overlay region
+        if bot <= top:
+            return None
+        sub = frame_bgr[top:bot, :]
+        m = self._log_mask(sub)
+        if int(np.count_nonzero(m)) < 80:
+            return None
+        moms = cv2.moments(m, binaryImage=True)
+        if moms["m00"] <= 0:
+            return None
+        cx = float(moms["m10"] / moms["m00"] / m.shape[1])
+        cy = float(moms["m01"] / moms["m00"] / m.shape[0])
+        return cx, cy
+
+    def _teacher_force_prob(self) -> float:
+        cfg = self.cfg
+        start = float(np.clip(cfg.teacher_force_start, 0.0, 1.0))
+        end = float(np.clip(cfg.teacher_force_end, 0.0, 1.0))
+        if start <= 0.0 and end <= 0.0:
+            return 0.0
+        decay = max(1, int(cfg.teacher_force_decay_steps))
+        t = min(1.0, float(self._global_steps) / float(decay))
+        return start + (end - start) * t
+
+    def _teacher_action(self, frame_bgr: np.ndarray) -> int:
+        """Simple scripted tree-seeking controller for bootstrap curriculum."""
+        fovea = self._log_pixel_frac_fovea(frame_bgr)
+        ctr = self._log_centroid(frame_bgr)
+        # If we are "blind", keep sweeping yaw but periodically pitch up/down
+        # to recover from staring at ground/sky.
+        if ctr is None:
+            self._teacher_blind_steps += 1
+            if (
+                self._teacher_blind_steps
+                % max(1, int(self.cfg.teacher_blind_pitch_every))
+                == 0
+            ):
+                # Most common failure is looking too far down at grass; bias
+                # pitch-up recovery first.
+                ginput.move_rel(0, -int(self.cfg.teacher_pitch_recover_px))
+            # Sweep right aggressively when blind.
+            return YAW_RIGHT
+        self._teacher_blind_steps = 0
+        cx, _cy = ctr
+        err_x = cx - 0.5
+        if fovea >= float(self.cfg.teacher_mine_fovea_frac) and abs(err_x) <= float(self.cfg.teacher_center_tol) * 1.4:
+            # Close + centered: fully commit to walking into the trunk and
+            # continuously punching. No jumping in this regime.
+            self._teacher_stuck_steps = 0
+            return FORWARD_ATTACK
+        if abs(err_x) > float(self.cfg.teacher_center_tol):
+            return YAW_RIGHT if err_x > 0 else YAW_LEFT
+        # Centered but still small: approach.
+        if fovea <= self._teacher_prev_fovea + 0.003:
+            self._teacher_stuck_steps += 1
+        else:
+            self._teacher_stuck_steps = 0
+        self._teacher_prev_fovea = fovea
+        # Jump only when clearly far from the trunk and truly stuck.
+        if (
+            self._teacher_stuck_steps >= 6
+            and fovea < float(self.cfg.teacher_mine_fovea_frac) * 0.55
+        ):
+            return FORWARD_JUMP
+        return FORWARD
 
     # ---- input application ------------------------------------------------
 
@@ -789,6 +880,9 @@ class MinecraftRealEnv(gym.Env):
         self._logs_collected = 0
         self._episode_start = time.perf_counter()
         self._steps = 0
+        self._teacher_prev_fovea = 0.0
+        self._teacher_stuck_steps = 0
+        self._teacher_blind_steps = 0
         self._obs_history = [obs.copy()]
         # Initialize the approach-reward baseline to whatever's visible at
         # episode start so the first step's delta is ~0. Without this, an
@@ -843,6 +937,19 @@ class MinecraftRealEnv(gym.Env):
             }
             return obs, 0.0, False, True, info
 
+        # Optional teacher-forced action override (curriculum bootstrap).
+        selected_action = int(action)
+        teacher_prob = self._teacher_force_prob()
+        teacher_used = False
+        if teacher_prob > 0.0 and self._sct is not None and np.random.random() < teacher_prob:
+            try:
+                pre_frame = self._grab_full_bgr()
+                selected_action = self._teacher_action(pre_frame)
+                teacher_used = True
+            except Exception:
+                selected_action = int(action)
+                teacher_used = False
+
         # Sticky actions / frame skip. Each call to env.step() applies the
         # chosen action ``action_repeat`` times, sleeping ``frame_time_s``
         # between each application. For mouse-delta actions (yaw/pitch)
@@ -860,7 +967,7 @@ class MinecraftRealEnv(gym.Env):
         for r in range(n_repeats):
             if _failsafe.is_stopping():
                 break
-            self._apply_action(int(action))
+            self._apply_action(int(selected_action))
             target_elapsed = (r + 1) * cfg.frame_time_s
             elapsed_so_far = time.perf_counter() - step_start
             sleep_for = target_elapsed - elapsed_so_far
@@ -893,7 +1000,11 @@ class MinecraftRealEnv(gym.Env):
         #    high once the agent has wood in inventory.
         sat_v = max(1e-6, cfg.log_visible_saturation_frac)
         log_visible_norm = min(1.0, full_log_frac / sat_v)
-        reward += cfg.reward_log_visible_max * log_visible_norm
+        # Once we're already aimed, this signal is less useful; down-weight it
+        # so the dominant incentive becomes "keep attacking", not "jiggle while
+        # still seeing lots of black pixels".
+        vis_scale = 0.35 if aimed else 1.0
+        reward += cfg.reward_log_visible_max * log_visible_norm * vis_scale
 
         # 2) "I'm approaching the wood" — per-step reward for the increase
         #    in visible-log fraction vs. the previous step. Rewards
@@ -916,17 +1027,26 @@ class MinecraftRealEnv(gym.Env):
         reward += cfg.reward_aim_dense * min(1.0, fovea_log_frac * 4.0)
 
         # 4) "I'm attacking it" — extra reward for swinging when aimed.
-        if action == FORWARD_ATTACK and aimed:
+        if selected_action == FORWARD_ATTACK and aimed:
             reward += cfg.reward_attack_when_aimed
+        elif aimed and selected_action in (
+            FORWARD,
+            FORWARD_JUMP,
+            YAW_LEFT,
+            YAW_RIGHT,
+            PITCH_UP,
+            PITCH_DOWN,
+        ):
+            reward += cfg.penalty_move_when_aimed_not_attacking
 
         # 5) Tiebreaker exploration shaping: when no log is visible, very
         #    small bonus for looking around or walking. These are dwarfed
         #    by the visible/approach rewards so they only matter in the
         #    "literally cannot see any wood" regime.
         if fovea_log_frac < cfg.explore_blind_threshold:
-            if action in (YAW_LEFT, YAW_RIGHT):
+            if selected_action in (YAW_LEFT, YAW_RIGHT):
                 reward += cfg.reward_explore_yaw_when_blind
-            elif action in (FORWARD, FORWARD_ATTACK, FORWARD_JUMP):
+            elif selected_action in (FORWARD, FORWARD_ATTACK, FORWARD_JUMP):
                 reward += cfg.reward_explore_forward_when_blind
 
         # 6) Curiosity / frame-diff shaping: tiny bonus for visual change
@@ -951,6 +1071,7 @@ class MinecraftRealEnv(gym.Env):
         self._had_log_last_step = have_log_now
 
         self._steps += 1
+        self._global_steps += 1
         elapsed = time.perf_counter() - self._episode_start
         terminated = self._logs_collected >= cfg.logs_to_succeed
         truncated = (not terminated) and (elapsed >= cfg.max_seconds)
@@ -981,7 +1102,10 @@ class MinecraftRealEnv(gym.Env):
             "logs_collected": int(self._logs_collected),
             "aimed": bool(aimed),
             "frame_diff": float(frame_diff),
-            "action_name": ACTION_NAMES[int(action)],
+            "action_name": ACTION_NAMES[int(selected_action)],
+            "policy_action_name": ACTION_NAMES[int(action)],
+            "teacher_used": bool(teacher_used),
+            "teacher_force_prob": float(teacher_prob),
         }
         return obs, float(reward), bool(terminated), bool(truncated), info
 
