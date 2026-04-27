@@ -190,6 +190,10 @@ class MinecraftRealConfig:
     # rendering the empty-slot background dark enough to look like a log.
     slot_diff_threshold: float = 8.0  # mean BGR delta vs. empty-slot baseline
     use_slot_diff_detector: bool = True
+    # Acquisition confirmation gate for RL training. Prevents one-frame
+    # slot-diff spikes from counting as "got wood".
+    log_confirm_steps: int = 3
+    slot_diff_margin: float = 2.0
     # ---- exploration shaping -------------------------------------------------
     # Rewards applied per step ONLY when the fovea sees no logs (i.e., the
     # agent is "blind" and needs to look around). Kept small — they're just
@@ -238,6 +242,7 @@ class MinecraftRealConfig:
     teacher_mine_fovea_frac: float = 0.06
     teacher_blind_pitch_every: int = 8
     teacher_pitch_recover_px: int = 18
+    teacher_scan_flip_every: int = 14
     # ---- auto-reset (in-game) ------------------------------------------------
     # After every episode the env can run an in-game chat command via
     # T -> Ctrl+V -> Enter. Defaults match the "find a tree, mine it, repeat"
@@ -337,6 +342,7 @@ class MinecraftRealEnv(gym.Env):
         self._slot_empty_baseline: int = 0
         self._effective_log_threshold: int = int(self.cfg.log_pixel_threshold)
         self._slot_empty_frame: np.ndarray | None = None
+        self._have_log_streak: int = 0
         self._reset_due_to_timeout: bool = False
         # First-reset flag: triggers the one-shot ``init_chat_commands``.
         self._init_done: bool = False
@@ -357,6 +363,7 @@ class MinecraftRealEnv(gym.Env):
         self._teacher_prev_fovea: float = 0.0
         self._teacher_stuck_steps: int = 0
         self._teacher_blind_steps: int = 0
+        self._teacher_scan_dir: int = 1  # +1 = right, -1 = left
 
     # ---- core helpers -----------------------------------------------------
 
@@ -545,6 +552,14 @@ class MinecraftRealEnv(gym.Env):
         # to recover from staring at ground/sky.
         if ctr is None:
             self._teacher_blind_steps += 1
+            # Sweep both directions while blind so exploration does not
+            # collapse into one-sided circles.
+            if (
+                self._teacher_blind_steps
+                % max(1, int(self.cfg.teacher_scan_flip_every))
+                == 0
+            ):
+                self._teacher_scan_dir *= -1
             if (
                 self._teacher_blind_steps
                 % max(1, int(self.cfg.teacher_blind_pitch_every))
@@ -553,8 +568,7 @@ class MinecraftRealEnv(gym.Env):
                 # Most common failure is looking too far down at grass; bias
                 # pitch-up recovery first.
                 ginput.move_rel(0, -int(self.cfg.teacher_pitch_recover_px))
-            # Sweep right aggressively when blind.
-            return YAW_RIGHT
+            return YAW_RIGHT if self._teacher_scan_dir > 0 else YAW_LEFT
         self._teacher_blind_steps = 0
         cx, _cy = ctr
         err_x = cx - 0.5
@@ -877,12 +891,14 @@ class MinecraftRealEnv(gym.Env):
         # Slot is empty by assumption; if it isn't, nothing the env can do.
         had_log_now = False
         self._had_log_last_step = had_log_now
+        self._have_log_streak = 0
         self._logs_collected = 0
         self._episode_start = time.perf_counter()
         self._steps = 0
         self._teacher_prev_fovea = 0.0
         self._teacher_stuck_steps = 0
         self._teacher_blind_steps = 0
+        self._teacher_scan_dir = 1 if np.random.random() < 0.5 else -1
         self._obs_history = [obs.copy()]
         # Initialize the approach-reward baseline to whatever's visible at
         # episode start so the first step's delta is ~0. Without this, an
@@ -894,6 +910,8 @@ class MinecraftRealEnv(gym.Env):
             "slot_empty_baseline_px": int(self._slot_empty_baseline),
             "effective_log_threshold": int(self._effective_log_threshold),
             "slot_diff_threshold": float(cfg.slot_diff_threshold),
+            "slot_diff_margin": float(cfg.slot_diff_margin),
+            "log_confirm_steps": int(cfg.log_confirm_steps),
             "use_slot_diff_detector": bool(cfg.use_slot_diff_detector),
             "hotbar_rect": (
                 self._hotbar.x, self._hotbar.y, self._hotbar.w, self._hotbar.h
@@ -981,10 +999,17 @@ class MinecraftRealEnv(gym.Env):
 
         slot_log_px = self._log_pixels_in_slot(frame)
         slot_diff = self._slot_diff_from_empty(frame)
+        diff_gate = slot_diff >= (cfg.slot_diff_threshold + cfg.slot_diff_margin)
+        px_gate = slot_log_px >= self._effective_log_threshold
         if cfg.use_slot_diff_detector and self._slot_empty_frame is not None:
-            have_log_now = slot_diff >= cfg.slot_diff_threshold
+            candidate_have_log = bool(diff_gate and px_gate)
         else:
-            have_log_now = slot_log_px >= self._effective_log_threshold
+            candidate_have_log = bool(px_gate)
+        if candidate_have_log:
+            self._have_log_streak += 1
+        else:
+            self._have_log_streak = 0
+        have_log_now = self._have_log_streak >= max(1, int(cfg.log_confirm_steps))
         fovea_log_frac = self._log_pixel_frac_fovea(frame)
         full_log_frac = self._log_pixel_frac_full(frame)
         aimed = fovea_log_frac >= cfg.aimed_threshold_frac
@@ -1097,6 +1122,8 @@ class MinecraftRealEnv(gym.Env):
             "slot_empty_baseline_px": int(self._slot_empty_baseline),
             "effective_log_threshold": int(self._effective_log_threshold),
             "slot_diff_threshold": float(cfg.slot_diff_threshold),
+            "slot_diff_margin": float(cfg.slot_diff_margin),
+            "log_confirm_steps": int(cfg.log_confirm_steps),
             "have_log_now": bool(have_log_now),
             "log_acquired": log_acquired,
             "logs_collected": int(self._logs_collected),

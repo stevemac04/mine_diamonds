@@ -373,6 +373,10 @@ def main() -> int:
     parser.add_argument("--clip-range", type=float, default=0.2)
     parser.add_argument("--max-seconds", type=float, default=60.0)
     parser.add_argument("--frame-time-s", type=float, default=0.05)
+    parser.add_argument("--log-confirm-steps", type=int, default=3,
+                        help="Consecutive confirmed frames required before counting log acquisition.")
+    parser.add_argument("--slot-diff-margin", type=float, default=2.0,
+                        help="Extra margin above slot_diff_threshold for acquisition confirmation.")
     parser.add_argument(
         "--action-repeat",
         type=int,
@@ -565,6 +569,8 @@ def main() -> int:
         auto_reset_chat_commands=reset_cmds,
         timeout_extra_chat_commands=timeout_cmds,
         post_reset_pause_s=float(args.post_reset_pause_s),
+        log_confirm_steps=int(args.log_confirm_steps),
+        slot_diff_margin=float(args.slot_diff_margin),
         teacher_force_start=float(args.teacher_force_start),
         teacher_force_end=float(args.teacher_force_end),
         teacher_force_decay_steps=int(args.teacher_force_decay_steps),
@@ -594,6 +600,11 @@ def main() -> int:
     print(f"  reset cmds      {list(cfg.auto_reset_chat_commands) or '<none>'}")
     print(f"  post-respawn    {list(cfg.post_respawn_chat_commands) or '<none>'}")
     print(f"  timeout cmds    {list(cfg.timeout_extra_chat_commands) or '<none>'}")
+    print(
+        f"  acquire gate   diff>={cfg.slot_diff_threshold + cfg.slot_diff_margin:.1f}, "
+        f"confirm_steps={cfg.log_confirm_steps}, "
+        f"slot_log_px>={cfg.log_pixel_threshold}"
+    )
     print(
         "  teacher force  "
         f"{cfg.teacher_force_start:.2f} -> {cfg.teacher_force_end:.2f} "

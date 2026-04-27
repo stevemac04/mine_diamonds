@@ -37,6 +37,15 @@ For **one run** with paper-style curves + `results_summary.md`:
 Output: `docs/figs/<run-name>/` (cumulative logs, per-episode metrics,
 PPO diagnostics, CSV).
 
+For a single high-impact visual combining learning curve + example
+acquisition frames:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\build_storyboard.py --run-name <run-name>
+```
+
+Output: `docs/figs/<run-name>/storyboard.png`
+
 ## Slides and narrative
 
 - `DEMO.md` — live demo checklist (scripted + optional RL monitoring)
