@@ -9,8 +9,9 @@ Code: `src/mine_diamonds/`. Training: `scripts/train_ppo_minecraft_real.py`.
 |---|---|
 | Env + rewards | `src/mine_diamonds/envs/minecraft_real.py` |
 | Train | `scripts/train_ppo_minecraft_real.py` |
-| Regenerate figs from a run | `python scripts/build_paper_figs.py --run-name <name>` (reads `runs/<name>/`, writes `docs/figs/<name>/`) |
-| Example exported plots (from past runs) | `docs/figs/` — see `docs/figs/README.txt` for which PNGs match what |
+| Figs tied to your Results text (from committed `episodes.csv`) | `python scripts/build_results_narrative_figs.py` → `docs/figs/narrative/` |
+| Regenerate per-run charts from a local `runs/<name>/` | `python scripts/build_paper_figs.py --run-name <name>` |
+| What’s in `docs/figs/` | `docs/figs/README.txt` |
 | Texture pack | `assets/texture_pack/README.md` |
 | On-stage demo checklist | `DEMO.md` |
 

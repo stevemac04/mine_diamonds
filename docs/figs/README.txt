@@ -1,18 +1,17 @@
-PNG files to pair with a typical Results writeup (not auto-generated; pick what fits your text).
+Figures built to match the Results text (numbers in the titles come from the
+same data as the CSV — regenerate after updating episodes.csv):
 
-General / training (single-window = slow wall time, policy still updating):
-  mc_real_superflat_long_y0/ppo_train.png
+  narrative/results_01_overview_from_csv.png
+  narrative/results_02_v14_aim_and_visibility.png
+  narrative/results_03_superflat_cumulative_and_visibility.png
 
-Early 40-episode run — strong looking behavior (aim, wood on screen) before stricter slot checks; use to support the false-positive story (do NOT use as "final success" proof by itself):
-  mc_real_v14_no_kill_reset/episodes_aim_rate.png
-  mc_real_v14_no_kill_reset/episodes_full_log_max.png
+Generate them:
 
-Long superflat run — cumulative logs vs timesteps (main learning-curve style plot):
-  mc_real_superflat_long_y0/cumulative_logs.png
+  python scripts/build_results_narrative_figs.py
 
-Optional (per-episode return / extra context):
-  mc_real_v14_no_kill_reset/episodes_return.png
-  mc_real_superflat_long_y0/episodes_return.png
+Source data (committed): mc_real_v14_no_kill_reset/episodes.csv and
+mc_real_superflat_long_y0/episodes.csv. Raw logs also live in runs/<name>/
+as episodes.jsonl (gitignored) when you train locally.
 
-Regenerate plots from a run folder: python scripts/build_paper_figs.py --run-name <name>
-(JSON source: runs/<name>/episodes.jsonl; runs/ is gitignored.)
+Optional TensorBoard / older pipeline plots (same runs, not from this script):
+  mc_real_*/cumulative_logs.png, ppo_train.png, etc. from build_paper_figs.py
