@@ -2,7 +2,7 @@
 
 Real-Minecraft RL (PPO) that learns to get wood from screen pixels + synthetic input.
 
-## Start Here (Grader Quick Path)
+## Start Here (Quick Path)
 
 If you only review 10 files/artifacts, review these:
 
