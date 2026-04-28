@@ -24,3 +24,7 @@ range in `pack_colors.py` to match a sampled pixel from
 
 Use **GUI Scale 2** and **windowed** mode so `capture.py` can find the
 client window and hotbar ROIs line up with defaults.
+
+## Successful RL evidence
+
+- Wood acquisition run video: [WOOD!.mp4 (Google Drive)](https://drive.google.com/file/d/1X8ne4xbKFtzojJPiqBfAn4OejCizwwOO/view?usp=sharing)

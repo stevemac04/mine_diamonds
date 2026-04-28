@@ -108,8 +108,8 @@ The collapse-to-zero on v11 is the slide.
 git status
 ```
 
-Show `docs/PAPER_DRAFT_REVISED.md`, `docs/PAPER_RESULTS_ASSETS.md`,
-and `docs/metrics/summary.md` to anyone asking for follow-up.
+For follow-up: show `docs/figs/README.txt` (which PNGs exist) and TensorBoard
+from `runs/<name>/` if they want the raw scalars.
 
 ---
 

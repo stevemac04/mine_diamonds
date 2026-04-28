@@ -107,7 +107,6 @@ class HeldState:
 
 
 IMMORTAL_CMDS = (
-    "/gamerule doImmediateRespawn true",
     "/gamemode survival",
     "/effect give @s minecraft:resistance 999999 4 true",
     "/effect give @s minecraft:regeneration 999999 4 true",

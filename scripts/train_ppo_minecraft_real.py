@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -374,6 +375,22 @@ def main() -> int:
     parser.add_argument("--max-seconds", type=float, default=60.0)
     parser.add_argument("--frame-time-s", type=float, default=0.05)
     parser.add_argument(
+        "--mine-hold-duration-s",
+        type=float,
+        default=3.6,
+        help="FORWARD_ATTACK: min wall seconds holding W+LMB per env.step().",
+    )
+    parser.add_argument(
+        "--reset-spread-blocks",
+        type=int,
+        default=0,
+        help="After /clear, optional random /tp ±R blocks (0=off). Needs cheats.",
+    )
+    parser.add_argument("--log-confirm-steps", type=int, default=3,
+                        help="Consecutive confirmed frames required before counting log acquisition.")
+    parser.add_argument("--slot-diff-margin", type=float, default=2.0,
+                        help="Extra margin above slot_diff_threshold for acquisition confirmation.")
+    parser.add_argument(
         "--action-repeat",
         type=int,
         default=4,
@@ -445,8 +462,7 @@ def main() -> int:
         help=(
             "Wall-clock seconds to wait after running reset chat commands "
             "before starting the next episode. Bump to 1.5+ if you use "
-            "'/kill @s' as a timeout command — respawning takes time even "
-            "with doImmediateRespawn=true."
+            "'/kill @s' as a timeout command — respawning takes time."
         ),
     )
     parser.add_argument(
@@ -464,12 +480,9 @@ def main() -> int:
         "--immortal",
         action="store_true",
         help=(
-            "Make the agent un-killable except by our own /kill on timeout. "
-            "Adds resistance + regeneration + saturation effects at level 4 "
-            "(numeric 255 = full immunity in resistance) plus immediate "
-            "respawn. Eliminates the most common cause of death-screen "
-            "deadlocks: the random policy walking into lava / off cliffs / "
-            "into mobs and the env not noticing."
+            "Make the agent un-killable in normal play (buff effects). "
+            "Adds survival + resistance + regeneration + saturation + "
+            "fire/water-breathing. No gamerules here; use --init-cmd for those."
         ),
     )
     parser.add_argument(
@@ -478,9 +491,8 @@ def main() -> int:
         default=None,
         help=(
             "MC chat command to run ONCE at training start (can pass "
-            "multiple). Use for world setup like '/gamerule "
-            "doImmediateRespawn true' or '/spawnpoint @s ~ ~ ~'. Anything "
-            "added by --immortal is appended after these."
+            "multiple). e.g. '/spawnpoint @s ~ ~ ~'. Anything from --immortal "
+            "is appended after these."
         ),
     )
     parser.add_argument(
@@ -540,7 +552,6 @@ def main() -> int:
         # of training" and "5 min of chat spam". The init list also runs
         # them once at the very first reset of the run.
         immortal_cmds = (
-            "/gamerule doImmediateRespawn true",
             "/gamemode survival",
             "/effect give @s minecraft:resistance 999999 4 true",
             "/effect give @s minecraft:regeneration 999999 4 true",
@@ -555,6 +566,8 @@ def main() -> int:
         monitor_index=args.monitor_index,
         max_seconds=float(args.max_seconds),
         frame_time_s=float(args.frame_time_s),
+        mine_hold_duration_s=float(args.mine_hold_duration_s),
+        reset_random_spread_blocks=int(args.reset_spread_blocks),
         action_repeat=int(args.action_repeat),
         yaw_step_px=int(args.yaw_step_px),
         pitch_step_px=int(args.pitch_step_px),
@@ -565,6 +578,8 @@ def main() -> int:
         auto_reset_chat_commands=reset_cmds,
         timeout_extra_chat_commands=timeout_cmds,
         post_reset_pause_s=float(args.post_reset_pause_s),
+        log_confirm_steps=int(args.log_confirm_steps),
+        slot_diff_margin=float(args.slot_diff_margin),
         teacher_force_start=float(args.teacher_force_start),
         teacher_force_end=float(args.teacher_force_end),
         teacher_force_decay_steps=int(args.teacher_force_decay_steps),
@@ -586,6 +601,15 @@ def main() -> int:
     print(f"  max_seconds     {cfg.max_seconds:.1f}  (per-episode timeout)")
     print(f"  frame_time_s    {cfg.frame_time_s:.3f}  (~{1/cfg.frame_time_s:.1f} Hz game tick)")
     print(f"  action_repeat   {cfg.action_repeat}  (1 decision = {agent_step_s*1000:.0f} ms)")
+    n_mine = int(math.ceil(cfg.mine_hold_duration_s / max(1e-6, cfg.frame_time_s)))
+    print(
+        f"  mine_hold       {cfg.mine_hold_duration_s:.2f} s  "
+        f"({n_mine} substeps on FORWARD_ATTACK)"
+    )
+    print(
+        f"  reset spread    ±{cfg.reset_random_spread_blocks} blocks "
+        f"(0=off; random /tp after /clear)"
+    )
     print(f"  yaw_step_px     {cfg.yaw_step_px}  ({yaw_per_decision} mickeys/decision)")
     print(f"  pitch_step_px   {cfg.pitch_step_px}")
     print(f"  device          {args.device}")
@@ -595,6 +619,11 @@ def main() -> int:
     print(f"  post-respawn    {list(cfg.post_respawn_chat_commands) or '<none>'}")
     print(f"  timeout cmds    {list(cfg.timeout_extra_chat_commands) or '<none>'}")
     print(
+        f"  acquire gate   diff>={cfg.slot_diff_threshold + cfg.slot_diff_margin:.1f}, "
+        f"confirm_steps={cfg.log_confirm_steps}, "
+        f"slot_log_px>={cfg.log_pixel_threshold}"
+    )
+    print(
         "  teacher force  "
         f"{cfg.teacher_force_start:.2f} -> {cfg.teacher_force_end:.2f} "
         f"over {cfg.teacher_force_decay_steps} steps"
@@ -603,17 +632,26 @@ def main() -> int:
     print()
 
     stop_file = run_dir / "STOP"
-    _failsafe.install(stop_file=stop_file)
     print(_failsafe.banner(stop_file=stop_file))
     print()
 
     print(f"You have {args.countdown}s to focus the Minecraft window.")
     print("Click into MC. The countdown starts now. DO NOT touch input again until")
     print(f"training is done (~{wall_hours:.2f} hours).")
-    print("If something goes wrong: tap F12. Keys release in <50ms.\n")
+    print("Failsafe watcher starts AFTER this countdown (avoids ghost stops).")
+    print("Hold F12 ~0.15s to stop. Keys release in <50ms.")
+    print(
+        "IMPORTANT: In Windows Settings → Accessibility → Keyboard, turn OFF "
+        "Sticky Keys, Filter Keys, and Toggle Keys for this session. They "
+        "make F12 look \"held\" to the failsafe and can stop training instantly.\n"
+    )
     for i in range(args.countdown, 0, -1):
         print(f"  starting in {i}s", flush=True)
         time.sleep(1.0)
+
+    # Install only after countdown so GetAsyncKeyState / stop-file races
+    # during "click into Minecraft" cannot terminate the run before step().
+    _failsafe.install(stop_file=stop_file)
 
     vec = DummyVecEnv([make_env(cfg)])
 
