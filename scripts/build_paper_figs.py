@@ -12,7 +12,6 @@ drop into LaTeX. This script:
     — the "the policy IS being updated" sanity proof).
   * Writes everything under ``docs/figs/<run_name>/``:
 
-        episodes_logs.png            per-episode logs_acquired count
         episodes_aim_rate.png        per-episode fraction of steps aimed
         episodes_full_log_max.png    per-episode peak wood-on-screen
         episodes_return.png          per-episode return
@@ -20,7 +19,6 @@ drop into LaTeX. This script:
                                      (the "RL learning curve" plot)
         ppo_train.png                4-panel: entropy, value loss,
                                      explained_var, approx_kl over time
-        results_summary.md           paragraph + table for the paper
         episodes.csv                 the JSONL re-flattened to CSV
 
 Usage:
@@ -174,121 +172,6 @@ def fourpanel_train(
     return plotted_any
 
 
-def write_summary_md(
-    rows: list[dict], out: Path, run_name: str, tb: dict[str, dict[str, list]]
-) -> None:
-    n_ep = len(rows)
-    if n_ep == 0:
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(
-            f"# {run_name} — no episodes recorded\n\n"
-            "The episodes.jsonl was empty. Either the run died before its "
-            "first episode finished, or the JSONL callback wasn't installed.\n",
-            encoding="utf-8",
-        )
-        return
-    logs = np.array([r.get("logs_acquired", 0) for r in rows])
-    aim = np.array([r.get("ep_aim_rate", 0.0) for r in rows])
-    full_max = np.array([r.get("ep_full_log_max", 0.0) for r in rows])
-    returns = np.array([r.get("ep_return", 0.0) for r in rows])
-    lengths = np.array([r.get("ep_len", 0) for r in rows])
-    success = (logs > 0).astype(np.float32)
-    last_step = int(rows[-1].get("global_step", 0))
-    elapsed = float(rows[-1].get("elapsed_s", 0.0))
-    halves = max(1, n_ep // 2)
-    early_succ = float(success[:halves].mean()) if halves > 0 else 0.0
-    late_succ = float(success[-halves:].mean()) if halves > 0 else 0.0
-
-    lines: list[str] = []
-    lines.append(f"# {run_name} — results")
-    lines.append("")
-    lines.append(
-        f"PPO + CnnPolicy on the real Minecraft Java client. "
-        f"{n_ep} episodes over {last_step:,} agent timesteps "
-        f"(~{elapsed/60:.1f} min wall-clock). "
-        f"Each episode is capped at 60 s in-game; success = at least one "
-        f"log mined under policy."
-    )
-    lines.append("")
-    lines.append("## Headline numbers")
-    lines.append("")
-    lines.append("| metric | value |")
-    lines.append("|---|---|")
-    lines.append(f"| episodes | {n_ep} |")
-    lines.append(f"| total timesteps | {last_step:,} |")
-    lines.append(f"| wall-clock minutes | {elapsed/60:.1f} |")
-    lines.append(f"| total logs mined under policy | **{int(logs.sum())}** |")
-    lines.append(
-        f"| success rate (logs ≥ 1) | **{success.mean()*100:.1f}%** "
-        f"({int(success.sum())}/{n_ep}) |"
-    )
-    lines.append(
-        f"| success rate, first half | {early_succ*100:.1f}% |"
-    )
-    lines.append(
-        f"| success rate, last half  | {late_succ*100:.1f}%  "
-        f"(Δ {(late_succ-early_succ)*100:+.1f} pp) |"
-    )
-    lines.append(f"| mean ep aim rate | {aim.mean()*100:.1f}% |")
-    lines.append(f"| mean ep full-log-max | {full_max.mean():.3f} |")
-    lines.append(f"| mean ep return | {returns.mean():.2f} |")
-    lines.append(f"| mean ep length (agent steps) | {lengths.mean():.1f} |")
-    lines.append("")
-
-    # PPO sanity: did the policy update at all?
-    train_tags = {
-        "entropy_loss": tb.get("train/entropy_loss", {}),
-        "value_loss":   tb.get("train/value_loss", {}),
-        "explained_variance": tb.get("train/explained_variance", {}),
-        "approx_kl":    tb.get("train/approx_kl", {}),
-    }
-    lines.append("## Policy update diagnostics (PPO internals)")
-    lines.append("")
-    lines.append(
-        "These are the smoking-gun \"PPO is actually updating the policy\" "
-        "metrics. We report first vs. last logged value:"
-    )
-    lines.append("")
-    lines.append("| metric | first | last | Δ |")
-    lines.append("|---|---|---|---|")
-    for name, s in train_tags.items():
-        vals = s.get("value", [])
-        if not vals:
-            lines.append(f"| {name} | — | — | — |")
-            continue
-        first = vals[0]
-        last_v = vals[-1]
-        lines.append(
-            f"| {name} | {first:+.4f} | {last_v:+.4f} | "
-            f"{last_v - first:+.4f} |"
-        )
-    lines.append("")
-    lines.append("## How to read these")
-    lines.append("")
-    lines.append(
-        "* `cumulative_logs.png` is the headline RL plot: total logs mined "
-        "under policy as a function of agent timesteps. A monotonically "
-        "rising line is RL working."
-    )
-    lines.append(
-        "* `episodes_logs.png` and `episodes_aim_rate.png` are per-episode "
-        "raw counts (no rolling mean) — paper-grade scatter."
-    )
-    lines.append(
-        "* `episodes_full_log_max.png` is *peak fraction of screen showing "
-        "wood per episode*. This is the cleanest signal of \"the agent "
-        "learned to look at trees\" before it learned to mine them."
-    )
-    lines.append(
-        "* `ppo_train.png` is the policy-update sanity panel: entropy "
-        "decay = exploring less, value loss → 0 = value head fitting, "
-        "explained_var rising = value head explaining returns, KL "
-        "bounded by clip = updates aren't blowing up."
-    )
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text("\n".join(lines), encoding="utf-8")
-
-
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--run-name", required=True)
@@ -322,7 +205,6 @@ def main() -> int:
             f"WARN: no episodes.jsonl rows under {run_dir}. "
             f"Did the run finish at least one episode?"
         )
-        write_summary_md(rows, out_dir / "results_summary.md", args.run_name, tb)
         return 0
 
     eps = [r["episode"] for r in rows]
@@ -342,13 +224,6 @@ def main() -> int:
         ov_logs = [r["logs_acquired"] for r in ov_rows]
         overlay_cum.append((ov, ov_steps, np.cumsum(ov_logs).tolist()))
 
-    lineplot(
-        eps, logs,
-        out=out_dir / "episodes_logs.png",
-        title=f"{args.run_name}: logs acquired per episode",
-        xlabel="episode #", ylabel="logs acquired",
-        rolling=10,
-    )
     lineplot(
         eps, aim,
         out=out_dir / "episodes_aim_rate.png",
@@ -378,7 +253,6 @@ def main() -> int:
         overlay=overlay_cum or None,
     )
     fourpanel_train(tb, out_dir / "ppo_train.png", args.run_name)
-    write_summary_md(rows, out_dir / "results_summary.md", args.run_name, tb)
 
     print(f"wrote artifacts to {out_dir.resolve()}")
     print(f"  - episodes:        {len(rows)}")

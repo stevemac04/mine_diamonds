@@ -1,56 +1,32 @@
-# mine-diamonds (DS340 / Minecraft RL)
+# mine-diamonds
 
-PPO in **real** Minecraft Java: screen capture in, SendInput out. The write-up
-and the plots that go in the **Results** section live under `docs/`.
+PPO on real Minecraft Java: window capture in, `SendInput` out.  
+Code: `src/mine_diamonds/`. Training: `scripts/train_ppo_minecraft_real.py`.
 
-## Grader: start here
+## Quick map
 
-| What | Where |
-|------|--------|
-| **Paper draft** | `docs/PAPER_WORKING_DRAFT.md` |
-| **Which figures go in Results** | `docs/FIGURES_FOR_RESULTS.md` |
-| **RL environment + rewards** | `src/mine_diamonds/envs/minecraft_real.py` |
-| **Train** | `scripts/train_ppo_minecraft_real.py` |
-| **Smoke test (capture + ROI)** | `scripts/smoke_minecraft_real.py` (writes to `eval/` — not in git) |
-| **Scripted tree chop (non-RL demo)** | `scripts/scripted_tree_chop.py` |
-| **Texture pack note** | `assets/texture_pack/README.md` |
+| | |
+|---|---|
+| Env + rewards | `src/mine_diamonds/envs/minecraft_real.py` |
+| Train | `scripts/train_ppo_minecraft_real.py` |
+| Regenerate figs from a run | `python scripts/build_paper_figs.py --run-name <name>` (reads `runs/<name>/`, writes `docs/figs/<name>/`) |
+| Example exported plots (from past runs) | `docs/figs/` — see `docs/figs/README.txt` for which PNGs match what |
+| Texture pack | `assets/texture_pack/README.md` |
+| On-stage demo checklist | `DEMO.md` |
 
-`docs/figs/<run>/` has PNGs + `results_summary.md` + `episodes.csv` per
-experiment. You only need the files listed in `FIGURES_FOR_RESULTS.md` unless
-you want the extras for context.
+`runs/` and `eval/` are gitignored (training output and local smoke captures). `docs/metrics/` is gitignored too (`aggregate_metrics.py` writes there if you use it).
 
-`runs/` and `docs/metrics/` are **gitignored** (training output and
-multi-run TensorBoard scrapes). Regenerate local charts with
-`scripts/aggregate_metrics.py` if you want them.
-
-`DEMO.md` is a short on-stage checklist. `docs/PRESENTATION_DATA.md` explains
-TensorBoard + `episodes.jsonl` if someone is reproducing from scratch.
-
-## Install (Windows, GPU optional)
+## Install (Windows)
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -e ".[minecraft-demo]"
-# RTX 50-series: may need PyTorch cu128 build from pytorch.org
 ```
 
-## Train (Minecraft must stay focused; F12 = stop)
+## Train (keep Minecraft focused; F12 stops)
 
 ```powershell
 $env:PYTHONUTF8=1
 python scripts\train_ppo_minecraft_real.py --run-name my_run --total-steps 18000 --immortal --countdown 25
 ```
-
-## Regenerate paper figures for one run
-
-```powershell
-python scripts\build_paper_figs.py --run-name <run_name>
-```
-
-## Repo layout (short)
-
-- `src/mine_diamonds/` — env, capture, input, vision, failsafe  
-- `scripts/` — training, metrics, demos  
-- `docs/` — paper text + committed figure exports  
-- `assets/texture_pack/` — what the vision pipeline expects
