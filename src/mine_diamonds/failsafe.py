@@ -5,27 +5,28 @@ left mouse button. If anything goes wrong mid-training, the user needs a
 RELIABLE way to (a) release those keys instantly and (b) stop the training
 loop without nuking their machine.
 
-This module spins up a single daemon thread that polls
-``GetAsyncKeyState(VK_F12)`` and an optional stop-file. When either
-condition fires, it:
+This module spins up a single daemon thread that polls ``GetAsyncKeyState``
+for **F12** (debounced — several consecutive polls must see it down) and,
+after a short grace period, an optional **stop-file**. When a stop fires:
 
-  1. Calls ``mine_diamonds.input.game_input.release_all()`` immediately so
-     the user regains control of WASD and the left mouse button in <50ms.
+  1. Calls ``mine_diamonds.input.game_input.release_all()`` immediately.
   2. Sets a process-wide stop event. ``is_stopping()`` returns True forever
      after that.
 
-A small SB3 callback (``FailsafeCallback`` in the trainer) returns False on
-its next ``_on_step`` so PPO exits its rollout collection loop. The trainer
-then saves a final checkpoint and returns.
+**Pause/Break is not watched** — on many laptops ``GetAsyncKeyState`` for
+VK_PAUSE glitches high and was stopping runs with no user input.
+
+**Stop-file grace:** for a few seconds after ``install()``, the watcher
+ignores the stop-file so cloud sync / tooling cannot instantly kill a new
+run right after ``/clear`` (the user symptom was "stops after clear").
+
+**Windows Sticky Keys / Filter Keys** can make ``GetAsyncKeyState(F12)``
+report \"down\" when you did not press it — disable those accessibility
+keyboard features while training.
 
 USAGE:
   from mine_diamonds.failsafe import install, is_stopping
   install(stop_file=Path('runs/mc_real_v1/STOP'))
-  ...
-  if is_stopping(): break
-
-The watcher is idempotent — calling ``install`` twice is a no-op the second
-time. Daemon thread, so it dies with the process.
 """
 
 from __future__ import annotations
@@ -41,17 +42,20 @@ if sys.platform != "win32":  # pragma: no cover
 
 _user32 = ctypes.windll.user32
 
-# Virtual-key codes we watch. F12 is the primary hotkey because it's
-# unbound in vanilla MC and unlikely to collide with anything the user is
-# doing accidentally.
 _VK_F12 = 0x7B
-_VK_PAUSE = 0x13  # second hotkey: 'Pause' / 'Break' on most keyboards.
 
 _stop_event = threading.Event()
 _stop_reason: str = ""
 _stop_file: Path | None = None
 _thread: threading.Thread | None = None
 _lock = threading.Lock()
+# Monotonic time when install() finished starting the watcher; stop-file
+# ignored until this + STOP_FILE_GRACE_S (seconds).
+_watch_start_perf: float = 0.0
+STOP_FILE_GRACE_S: float = 4.0
+# Sticky Keys / accessibility can latch F12; extra polls reduce false stops.
+_HOTKEY_CONSECUTIVE_POLLS = 5
+_POLL_INTERVAL_S = 0.03
 
 
 def is_stopping() -> bool:
@@ -64,12 +68,7 @@ def stop_reason() -> str:
 
 
 def _emergency_release() -> None:
-    """Best-effort: release every key the env could be holding right now.
-
-    Called from the watcher thread, so it must not raise. We try the high-
-    level ``release_all`` first; if anything fails we fall back to the
-    raw win_sendinput primitives.
-    """
+    """Best-effort: release every key the env could be holding right now."""
     try:
         from mine_diamonds.input import game_input
 
@@ -115,26 +114,53 @@ def request_stop(reason: str = "manual") -> None:
 
 
 def _watcher() -> None:
+    global _watch_start_perf
+    f12_down_ticks = 0
     while not _stop_event.is_set():
-        if _user32.GetAsyncKeyState(_VK_F12) & 0x8000:
-            request_stop("F12 hotkey")
-            return
-        if _user32.GetAsyncKeyState(_VK_PAUSE) & 0x8000:
-            request_stop("Pause/Break hotkey")
-            return
-        if _stop_file is not None and _stop_file.exists():
-            request_stop(f"stop-file {_stop_file} appeared")
-            return
-        time.sleep(0.04)
+        f12_now = bool(_user32.GetAsyncKeyState(_VK_F12) & 0x8000)
+        if f12_now:
+            f12_down_ticks += 1
+            if f12_down_ticks >= _HOTKEY_CONSECUTIVE_POLLS:
+                request_stop("F12 hotkey")
+                return
+        else:
+            f12_down_ticks = 0
+
+        if _stop_file is not None:
+            elapsed = time.perf_counter() - _watch_start_perf
+            if elapsed >= STOP_FILE_GRACE_S and _stop_file.exists():
+                request_stop(f"stop-file {_stop_file} appeared")
+                return
+
+        time.sleep(_POLL_INTERVAL_S)
 
 
 def install(stop_file: Path | None = None) -> None:
-    """Start the watcher thread (idempotent). ``stop_file`` is optional."""
-    global _stop_file, _thread
+    """Start the watcher thread (idempotent).
+
+    Clears any prior stop state, removes a leftover stop-file, then starts
+    the watcher. Stop-file polling is disabled for STOP_FILE_GRACE_S so a
+    stray file cannot end the run before the first env steps.
+    """
+    global _stop_file, _thread, _stop_reason, _watch_start_perf
     with _lock:
         if _thread is not None:
             return
-        _stop_file = stop_file
+        _stop_event.clear()
+        _stop_reason = ""
+        if stop_file is not None:
+            p = Path(stop_file)
+            if p.exists():
+                try:
+                    p.unlink()
+                    print(
+                        f"[FAILSAFE] removed leftover stop file: {p}",
+                        flush=True,
+                    )
+                except OSError as e:
+                    print(f"[FAILSAFE] WARN: could not remove {p}: {e}", flush=True)
+        _stop_file = Path(stop_file) if stop_file is not None else None
+        _watch_start_perf = time.perf_counter()
         _thread = threading.Thread(
             target=_watcher, daemon=True, name="mine-diamonds-failsafe"
         )
@@ -145,20 +171,18 @@ def banner(stop_file: Path | None = None) -> str:
     """Return a one-screen description of the failsafe for the user."""
     lines = [
         "=== FAILSAFE — read this BEFORE clicking into Minecraft ===",
-        "  At any time, hit F12 (or Pause/Break). The watcher runs",
-        "  outside Minecraft's focus, so it works even while MC is",
-        "  capturing input. On press it will:",
+        "  Hold F12 ~0.15s to stop (debounced; brief taps are ignored).",
+        "  Turn OFF Windows Sticky Keys / Filter Keys / Toggle Keys",
+        "  (Settings → Accessibility → Keyboard) — they fake F12 to the watcher.",
+        "  Stop-file is ignored for the first few seconds after start.",
+        "  On stop:",
         "     1. release W, A, S, D, Space, Ctrl, Shift, LMB, RMB",
         "     2. set a stop flag; PPO exits at the next env step",
         "     3. save a final checkpoint to <run_dir>/final.zip",
     ]
     if stop_file is not None:
-        lines.append(
-            f"  You can also stop from another terminal with:"
-        )
-        lines.append(
-            f'     New-Item -ItemType File -Force -Path "{stop_file}"'
-        )
+        lines.append("  You can also stop from another terminal with:")
+        lines.append(f'     New-Item -ItemType File -Force -Path "{stop_file}"')
     lines.append(
         "  If the keyboard is somehow unresponsive: Win+L to lock the"
     )
