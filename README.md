@@ -14,6 +14,8 @@ Code: `src/mine_diamonds/`. Training: `scripts/train_ppo_minecraft_real.py`.
 | What’s in `docs/figs/` | `docs/figs/README.txt` |
 | Texture pack | `assets/texture_pack/README.md` |
 | On-stage demo checklist | `DEMO.md` |
+| Check hotbar + fovea on your resolution (one PNG) | `python scripts\window_fit_check.py` |
+| Full smoke (inputs, reward) | `python scripts\smoke_minecraft_real.py` |
 
 `runs/` and `eval/` are gitignored (training output and local smoke captures). `docs/metrics/` is gitignored too (`aggregate_metrics.py` writes there if you use it).
 
