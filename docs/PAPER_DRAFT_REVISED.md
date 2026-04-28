@@ -1,3 +1,5 @@
+> **Note:** Use **`docs/PAPER_WORKING_DRAFT.md`** for the class submission. This file is an older intro/methods variant kept for reference.
+
 # Reinforcement Learning Minecraft Agent
 
 Daniel Cusack & Stephan MacDougall  

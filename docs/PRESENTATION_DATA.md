@@ -25,8 +25,8 @@ From repo root, after at least one run exists:
 .\.venv\Scripts\python.exe scripts\aggregate_metrics.py
 ```
 
-Writes `docs/metrics/summary.md`, `docs/metrics/runs.csv`, and
-`docs/metrics/mc_*.png` (compare runs at a glance).
+Writes under `docs/metrics/` (gitignored: compare many runs; do not rely on
+that folder being in the repo).
 
 For **one run** with paper-style curves + `results_summary.md`:
 
