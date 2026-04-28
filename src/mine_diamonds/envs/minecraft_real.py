@@ -200,15 +200,28 @@ class MinecraftRealConfig:
     # tiebreakers above the step penalty so spinning beats standing still.
     # The "wood-seeking" gradient comes from ``reward_log_visible_max`` and
     # ``reward_log_approach_max`` below, which are MUCH larger than these.
-    reward_explore_yaw_when_blind: float = 0.04
-    reward_explore_forward_when_blind: float = 0.014
+    # When blind, prefer *moving* to new terrain over spinning in one spot.
+    reward_explore_forward_when_blind: float = 0.07
+    reward_explore_yaw_when_blind: float = 0.012
+    # Small bonus for sprinting blind exploration (W + look around elsewhere).
+    reward_sprint_blind: float = 0.04
+    # Penalty for many consecutive yaw-only steps while still blind+treeless
+    # (reduces in-place circles in empty areas).
+    blind_yaw_streak_threshold: int = 8
+    penalty_blind_yaw_streak: float = 0.028
     # Below this fovea_log_frac the agent is considered "blind" for shaping.
     explore_blind_threshold: float = 0.02
+    # "Treeless" for streak penalty: no meaningful wood in world frame.
+    explore_treeless_log_frac: float = 0.012
+    # Heuristic: bright upper band and almost no log pixels => staring at sky.
+    penalty_sky_stare: float = 0.06
+    sky_bright_min_gray: float = 105.0
+    sky_bright_saturate: float = 100.0  # (gray_mean - min) / saturate -> 0..1
     # EMA of pitch-up (+1) vs pitch-down (-1) per env step. When |EMA| is
     # large the camera is drifting into sky/ground; we apply a small blind
     # penalty so PPO learns to balance look-up with look-down.
     pitch_imbalance_ema_alpha: float = 0.2
-    penalty_pitch_imbalance: float = 0.03
+    penalty_pitch_imbalance: float = 0.045
     # Fovea reward scales linearly until this fraction of the fovea is log
     # pixels, then caps (stronger signal when actually staring at wood).
     fovea_aim_reference_frac: float = 0.10
@@ -247,13 +260,17 @@ class MinecraftRealConfig:
     teacher_force_end: float = 0.0
     teacher_force_decay_steps: int = 10_000
     teacher_center_tol: float = 0.08
-    teacher_mine_fovea_frac: float = 0.06
     teacher_blind_pitch_every: int = 8
     teacher_pitch_recover_px: int = 16
     teacher_scan_flip_every: int = 14
+    # Blind exploration: 1 of every N steps yaws; the rest are FORWARD
+    # so the agent leaves treeless ground instead of idling in circles.
+    teacher_blind_run_yaw_cycle: int = 5
     # When |pitch EMA| exceeds this in teacher blind mode, nudge pitch down
     # (sky) or up (ground) instead of only recovering from ground.
-    teacher_pitch_balance_ema: float = 0.75
+    teacher_pitch_balance_ema: float = 0.6
+    # Slightly more aggressive mine threshold so teacher commits to W+LMB sooner.
+    teacher_mine_fovea_frac: float = 0.05
     # ---- auto-reset (in-game) ------------------------------------------------
     # After every episode the env can run an in-game chat command via
     # T -> Ctrl+V -> Enter. Defaults match the "find a tree, mine it, repeat"
@@ -288,11 +305,12 @@ class MinecraftRealConfig:
     window_watchdog_poll_s: float = 1.0
     fovea_log_pixel_norm: int = 4000  # divisor for fovea-pixel shaping (capped at 1.0)
     reward_step_penalty: float = -0.005
-    reward_aim_dense: float = 0.85    # max per-step reward for log in fovea (see fovea_aim_reference_frac)
-    reward_attack_when_aimed: float = 1.2  # bonus per step for forward_attack while aimed
+    reward_aim_dense: float = 0.9     # max per-step reward for log in fovea
+    reward_attack_when_aimed: float = 2.0  # strong: hold attack when crosshair is on log
     # Penalty for moving/turning while already aimed at wood but NOT attacking.
-    # This discourages the "find tree then strafe/yaw around it forever" loop.
-    penalty_move_when_aimed_not_attacking: float = -0.08
+    penalty_move_when_aimed_not_attacking: float = -0.22
+    # Optional extra when aimed + mining (forward_attack) — on top of reward_attack_when_aimed
+    reward_mine_commit_bonus: float = 0.35
     reward_log_acquired: float = 25.0  # sparse reward for getting a log
     aimed_threshold_frac: float = 0.05  # fovea log-px fraction above this counts as "aimed"
     hotbar: HotbarSpec | None = None  # if set, overrides auto computation
@@ -377,6 +395,7 @@ class MinecraftRealEnv(gym.Env):
         self._teacher_scan_dir: int = 1  # +1 = right, -1 = left
         # Running imbalance of pitch-up vs pitch-down (rough proxy for sky/ground drift).
         self._pitch_imbalance_ema: float = 0.0
+        self._blind_yaw_streak: int = 0
 
     # ---- core helpers -----------------------------------------------------
 
@@ -527,6 +546,24 @@ class MinecraftRealEnv(gym.Env):
             return 0.0
         return float(self._log_mask(world).mean()) / 255.0
 
+    def _sky_hint_score(self, frame_bgr: np.ndarray) -> float:
+        """Rough 0..1: bright, log-empty upper band (typical sky view)."""
+        if frame_bgr.size == 0:
+            return 0.0
+        h = frame_bgr.shape[0]
+        top_end = int(h * 0.3)
+        if top_end < 4:
+            return 0.0
+        band = frame_bgr[:top_end, :]
+        m = self._log_mask(band)
+        if float(m.mean()) / 255.0 > 0.02:
+            return 0.0
+        gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
+        mu = float(gray.mean())
+        sat = max(1e-3, float(self.cfg.sky_bright_saturate))
+        t = (mu - float(self.cfg.sky_bright_min_gray)) / sat
+        return float(np.clip(t, 0.0, 1.0))
+
     def _log_centroid(self, frame_bgr: np.ndarray) -> tuple[float, float] | None:
         """Centroid of log-colored pixels in cropped world view, normalized [0,1]."""
         if frame_bgr.size == 0:
@@ -565,8 +602,6 @@ class MinecraftRealEnv(gym.Env):
         # to recover from staring at ground/sky.
         if ctr is None:
             self._teacher_blind_steps += 1
-            # Sweep both directions while blind so exploration does not
-            # collapse into one-sided circles.
             if (
                 self._teacher_blind_steps
                 % max(1, int(self.cfg.teacher_scan_flip_every))
@@ -581,14 +616,17 @@ class MinecraftRealEnv(gym.Env):
                 px = int(self.cfg.teacher_pitch_recover_px)
                 ema = float(self._pitch_imbalance_ema)
                 bal = float(self.cfg.teacher_pitch_balance_ema)
-                # Net "look up" in recent steps → pitch down; net look down → pitch up;
-                # else nudge up to escape staring at the ground (common case).
                 if ema > bal:
                     ginput.move_rel(0, px)
                 elif ema < -bal:
                     ginput.move_rel(0, -px)
                 else:
                     ginput.move_rel(0, -px)
+            # Run forward most steps; occasionally yaw to scan. Escapes
+            # empty patches without in-place circle spam.
+            cyc = max(2, int(self.cfg.teacher_blind_run_yaw_cycle))
+            if (self._teacher_blind_steps - 1) % cyc < cyc - 1:
+                return FORWARD
             return YAW_RIGHT if self._teacher_scan_dir > 0 else YAW_LEFT
         self._teacher_blind_steps = 0
         cx, _cy = ctr
@@ -921,6 +959,7 @@ class MinecraftRealEnv(gym.Env):
         self._teacher_blind_steps = 0
         self._teacher_scan_dir = 1 if np.random.random() < 0.5 else -1
         self._pitch_imbalance_ema = 0.0
+        self._blind_yaw_streak = 0
         self._obs_history = [obs.copy()]
         # Initialize the approach-reward baseline to whatever's visible at
         # episode start so the first step's delta is ~0. Without this, an
@@ -1083,9 +1122,11 @@ class MinecraftRealEnv(gym.Env):
         aim_linear = min(1.0, fovea_log_frac / ref)
         reward += cfg.reward_aim_dense * aim_linear
 
-        # 4) "I'm attacking it" — extra reward for swinging when aimed.
+        # 4) "I'm attacking it" — large bonus for W+LMB while aimed; extra
+        #    for *commitment* to mining the block under the crosshair.
         if selected_action == FORWARD_ATTACK and aimed:
             reward += cfg.reward_attack_when_aimed
+            reward += float(cfg.reward_mine_commit_bonus)
         elif aimed and selected_action in (
             FORWARD,
             FORWARD_JUMP,
@@ -1096,19 +1137,38 @@ class MinecraftRealEnv(gym.Env):
         ):
             reward += cfg.penalty_move_when_aimed_not_attacking
 
-        # 5) Tiebreaker exploration shaping: when no log is visible, very
-        #    small bonus for looking around or walking. These are dwarfed
-        #    by the visible/approach rewards so they only matter in the
-        #    "literally cannot see any wood" regime.
+        # 5) Exploratory tie-breakers when still searching (blind in fovea).
+        treeless = full_log_frac < float(cfg.explore_treeless_log_frac)
+        sky_hint = self._sky_hint_score(frame)
         if fovea_log_frac < cfg.explore_blind_threshold:
             if selected_action in (YAW_LEFT, YAW_RIGHT):
                 reward += cfg.reward_explore_yaw_when_blind
-            elif selected_action in (FORWARD, FORWARD_ATTACK, FORWARD_JUMP):
+            if selected_action in (FORWARD, FORWARD_ATTACK, FORWARD_JUMP):
                 reward += cfg.reward_explore_forward_when_blind
+            if (
+                treeless
+                and selected_action == FORWARD_JUMP
+            ):
+                reward += float(cfg.reward_sprint_blind)
+            if treeless and sky_hint > 0.15:
+                reward -= float(cfg.penalty_sky_stare) * float(sky_hint)
+            if treeless:
+                if selected_action in (YAW_LEFT, YAW_RIGHT):
+                    self._blind_yaw_streak = min(400, int(self._blind_yaw_streak) + 1)
+                else:
+                    self._blind_yaw_streak = max(0, int(self._blind_yaw_streak) - 1)
+                thr = int(cfg.blind_yaw_streak_threshold)
+                if int(self._blind_yaw_streak) > thr:
+                    over = int(self._blind_yaw_streak) - thr
+                    reward -= float(cfg.penalty_blind_yaw_streak) * over
+            else:
+                self._blind_yaw_streak = 0
             # Discourage runaway pitch (sky/ground) while blind.
             reward -= cfg.penalty_pitch_imbalance * abs(
                 float(self._pitch_imbalance_ema)
             )
+        else:
+            self._blind_yaw_streak = 0
 
         # 6) Curiosity / frame-diff shaping: tiny bonus for visual change
         #    vs. the observation ``frame_diff_lookback_steps`` ago. Just
@@ -1170,6 +1230,8 @@ class MinecraftRealEnv(gym.Env):
             "teacher_used": bool(teacher_used),
             "teacher_force_prob": float(teacher_prob),
             "pitch_imbalance_ema": float(self._pitch_imbalance_ema),
+            "sky_hint": float(sky_hint),
+            "blind_yaw_streak": int(self._blind_yaw_streak),
         }
         return obs, float(reward), bool(terminated), bool(truncated), info
 

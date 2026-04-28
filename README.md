@@ -33,3 +33,11 @@ pip install -e ".[minecraft-demo]"
 $env:PYTHONUTF8=1
 python scripts\train_ppo_minecraft_real.py --run-name my_run --total-steps 18000 --immortal --countdown 25
 ```
+
+**If you need a log on video:** give the policy time and use teacher + long episodes, e.g.
+
+```powershell
+python scripts\train_ppo_minecraft_real.py --run-name video_log --total-steps 25000 --max-seconds 150 --immortal --teacher-force-start 0.55 --teacher-force-end 0.1 --teacher-force-decay-steps 20000 --countdown 25
+```
+
+**Guaranteed tree + log (no RL):** for a clean recording, use the hand-coded state machine: `python scripts\scripted_tree_chop.py --countdown 8` (F12 to stop). Same vision stack as the env.
